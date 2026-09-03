@@ -589,16 +589,17 @@ function stripSearchContentTypes(tools) {
   return stripped ? repaired : tools;
 }
 
-// Strict upstreams (wethink DGX Spark vLLM, several resellers, anything else
-// validating with a Pydantic model) refuse an empty `tools: []` array with
-// `Value error, tools must not be an empty array. Either provide at least one
-// tool or omit the field entirely`. Codex sends `tools: []` to disable tools
-// for plain-chat turns, compactions, and the Compatibility Probe, so the
-// refusal hits on every non-tool turn against any strict provider. Strip the
-// empty array first, then drop a `tool_choice` left dangling by the strip --
-// the order is load-bearing, because a dangling choice triggers its own
-// `When using tool_choice, tools must be set` 400. Returns true if the
-// payload changed so callers can log the rewrite and short-circuit.
+// Strict upstreams (any Pydantic-validated surface -- vLLM >= 0.20.0 by
+// default, several resellers) refuse an empty `tools: []` array with
+// `Value error, tools must not be an empty array. Either provide at
+// least one tool or omit the field entirely`. Codex sends `tools: []`
+// to disable tools for plain-chat turns, compactions, and the
+// Compatibility Probe, so the refusal hits on every non-tool turn
+// against any strict provider. Strip the empty array first, then drop
+// a `tool_choice` left dangling by the strip -- the order is
+// load-bearing, because a dangling choice triggers its own
+// `When using tool_choice, tools must be set` 400. Returns true if
+// the payload changed so callers can log the rewrite and short-circuit.
 function stripEmptyTools(payload) {
   if (!payload || typeof payload !== "object") return false;
   const tools = payload.tools;
