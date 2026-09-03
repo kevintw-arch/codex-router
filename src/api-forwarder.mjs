@@ -589,6 +589,36 @@ function stripSearchContentTypes(tools) {
   return stripped ? repaired : tools;
 }
 
+// Strict upstreams (any Pydantic-validated surface -- vLLM >= 0.20.0 by
+// default, several resellers) refuse an empty `tools: []` array with
+// `Value error, tools must not be an empty array. Either provide at
+// least one tool or omit the field entirely`. Codex sends `tools: []`
+// to disable tools for plain-chat turns, compactions, and the
+// Compatibility Probe, so the refusal hits on every non-tool turn
+// against any strict provider. Strip the empty array first, then drop
+// a `tool_choice` left dangling by the strip -- the order is
+// load-bearing, because a dangling choice triggers its own
+// `When using tool_choice, tools must be set` 400. Returns true if
+// the payload changed so callers can log the rewrite and short-circuit.
+function stripEmptyTools(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  const tools = payload.tools;
+  const hasEmptyTools = Array.isArray(tools) && tools.length === 0;
+  if (!hasEmptyTools && !("tool_choice" in payload)) return false;
+  let changed = false;
+  if (hasEmptyTools) {
+    delete payload.tools;
+    changed = true;
+  }
+  if (changed || !Array.isArray(payload.tools) || payload.tools.length === 0) {
+    if ("tool_choice" in payload) {
+      delete payload.tool_choice;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function normalizeBody(buffer, contentType, route) {
   if (!buffer.length || !String(contentType || "").includes("application/json")) {
     const error = new Error("API-provider requests require a JSON body.");
@@ -721,6 +751,17 @@ function normalizeBody(buffer, contentType, route) {
   // one tool this endpoint accepts it on.
   if (provider.id === "meta" && Array.isArray(payload.tools)) {
     payload.tools = stripSearchContentTypes(payload.tools);
+  }
+  // Strict upstreams refuse an empty `tools: []` and a dangling `tool_choice`;
+  // strip both before any profile-specific branch can pick them up and try to
+  // fold them. See `stripEmptyTools` for the upstream refusals it prevents
+  // (litellm.BadRequestError ... "tools" must not be an empty array, plus the
+  // matching "When using tool_choice, tools must be set"). Logged when the
+  // request actually changes, because that is a content rewrite of content the
+  // caller sent -- exactly the change an unattended service must not make
+  // in silence.
+  if (stripEmptyTools(payload)) {
+    console.error(`[api-forwarder] stripped empty tools/tool_choice from outbound ${route} (${model.gatewayModel})`);
   }
   if (Array.isArray(payload.messages)) {
     payload.messages = sanitizeChatToolHistory(payload.messages, provider, model);
@@ -906,22 +947,9 @@ function normalizeBody(buffer, contentType, route) {
     // and it folds onto `max` because that is the tier it is asking for.
     // Everything else passes through as the literal the endpoint accepts.
     if (payload.reasoning_effort === "ultra") payload.reasoning_effort = "max";
-    // The same build refuses two tool shapes Codex sends routinely, both
-    // measured live: an empty list answers "`tools` must not be an empty
-    // array. Either provide at least one tool or omit the field entirely",
-    // and a choice with nothing to choose from answers "When using
-    // `tool_choice`, `tools` must be set". `summarize()` in the router sends
-    // `tools: []` on every compaction, and this model auto-compacts at 230K of
-    // its 262K window, so left alone every compaction against it 400s. Strip
-    // the empty list first, then drop the tool choice that strip leaves
-    // dangling -- the order is what keeps the second rejection from replacing
-    // the first. The repair belongs at this last hop rather than in the
-    // compaction path because an empty tool list is legal on every other
-    // forwarder, and it is exactly how compaction disables tool use there.
-    if (Array.isArray(payload.tools) && payload.tools.length === 0) delete payload.tools;
-    if (!Array.isArray(payload.tools) || payload.tools.length === 0) {
-      delete payload.tool_choice;
-    }
+    // Empty-tools and dangling-tool_choice repair happens uniformly in the
+    // shared `stripEmptyTools()` call above; the rest of this block is
+    // local to this provider's other measured refusals.
     // Third measured refusal on the same endpoint: "System message must be at
     // the beginning." A conversation that already satisfies the rule is left
     // byte-identical -- see normalizeQwen38SystemMessages for the rule, the

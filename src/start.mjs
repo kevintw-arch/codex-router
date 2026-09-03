@@ -35,6 +35,12 @@ import {
 } from "./proxy-environment.mjs";
 import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
 import { cursorTunnelRunSpec } from "./cursor-cloudflare-tunnel.mjs";
+import { PROVIDER_SELECTION_PATH } from "./paths.mjs";
+import {
+  configuredProviderIds,
+  disableProvider,
+  readProviderSelectionDetail,
+} from "./provider-selection.mjs";
 
 // Before anything reads the environment or spawns a child. A service manager
 // hands this process the proxy the install recorded; a shell hands it whatever
@@ -121,6 +127,61 @@ const callerKey = assertCallerSecret(
   readFileSync(CALLER_SECRET_PATH, "utf8").trim(),
 );
 writeLiteLlmConfig();
+
+// Disabled-by-default guarantee: every provider the operator explicitly
+// enabled and no longer has a credential for is removed from the selection
+// file at this point. Without it, the catalog continues to advertise models
+// whose every request fails with "provider_api_key_missing" and the user
+// only learns from the log.
+//
+// Two buckets matter:
+//   - providers listed in enabled-providers.json that this build no longer
+//     recognises (version skew after an upgrade);
+//   - recognised providers without a credential.
+//
+// Both stay on disk; both the catalog and the on-disk file must agree about
+// what is routable. `readProviderSelectionDetail()` already separates the
+// two buckets; we disable from both before any forwarder can answer a turn
+// against an unconfigured endpoint. Idempotent: a provider that is already
+// absent is logged once and skipped.
+function pruneUnconfiguredProviders() {
+  let selection;
+  try {
+    selection = readProviderSelectionDetail();
+  } catch {
+    return;
+  }
+  if (!selection.providers.length && !selection.ignored?.length) return;
+  const configured = new Set(configuredProviderIds());
+  const removals = [
+    ...(selection.ignored || []).map((id) => ({ id, reason: "unrecognised" })),
+    ...selection.providers
+      .filter((id) => !configured.has(id))
+      .map((id) => ({ id, reason: "no credential" })),
+  ];
+  const removed = [];
+  for (const { id } of removals) {
+    try {
+      disableProvider(id);
+      removed.push(id);
+    } catch (error) {
+      console.error(
+        `[codex-router] could not auto-disable ${id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  if (removed.length) {
+    console.error(
+      `[codex-router] disabled ${removed.length} provider(s) from ${PROVIDER_SELECTION_PATH}: ${removed.join(", ")}`,
+    );
+    for (const _id of removed) {
+      console.error(
+        `[codex-router] run: codex-router setup (and re-pick the provider(s) above) to restore them.`,
+      );
+    }
+  }
+}
+pruneUnconfiguredProviders();
 
 // A checked local model means the operator intends to route through Ollama,
 // so keep its daemon available for the gateway. This never installs software
