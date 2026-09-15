@@ -2343,6 +2343,32 @@ test("router synthesizes routed compaction and safely replays it to native model
     assert.match(oversizedCheckpoint, /BEGIN-LONG-USER/u);
     assert.match(oversizedCheckpoint, /END-LONG-USER/u);
     assert.match(oversizedCheckpoint, /"truncated": true/u);
+
+    // The compaction request itself must not replay a near-window transcript.
+    // A 1 MiB DeepSeek route reaches this branch with a deliberately large
+    // source; the upstream should receive only the bounded user tail plus the
+    // deterministic catalog/prompt, otherwise LiteLLM rejects the very request
+    // that is supposed to make the session smaller.
+    const upstreamOversizedUser = `BEGIN-UPSTREAM-COMPACTION-USER-${"z".repeat(3_000_000)}-END-UPSTREAM-COMPACTION-USER`;
+    const beforeBoundedCompaction = gatewayRequests.length;
+    const boundedCompaction = await compact([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: upstreamOversizedUser }],
+      },
+    ]);
+    assert.equal(boundedCompaction.status, 200);
+    assert.equal(gatewayRequests.length, beforeBoundedCompaction + 1);
+    const boundedInput = gatewayRequests.at(-1).body.input;
+    assert.equal(boundedInput.length, 2, "near-window compaction uses the bounded catalog input");
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(boundedInput), "utf8") < 200_000,
+      "the full near-window transcript is not sent to the summarizer",
+    );
+    assert.match(boundedInput[0].content[0].text, /ROUTER SOURCE CATALOG/u);
+    assert.match(boundedInput[0].content[0].text, /U001/u);
+    assert.match(boundedInput[1].content[0].text, /Return exactly one JSON object/u);
   } finally {
     await stopChild(router);
     await Promise.all([closeServer(native.server), closeServer(gateway.server)]);

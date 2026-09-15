@@ -72,6 +72,54 @@ test("an Ollama MLX context rejection becomes a non-retryable context error", ()
   assert.doesNotMatch(payload.error.message, /LiteLLM|APIConnectionError/);
 });
 
+test("an impossible zero input count is not presented as a measurement", () => {
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        "litellm.APIConnectionError: input length (0 tokens) exceeds the model's maximum context length (262144 tokens).",
+    },
+  });
+
+  const failure = contextLengthFailure(bodyText);
+  assert.equal(failure.inputTokens, undefined);
+  assert.equal(failure.maximumTokens, 262144);
+
+  const payload = translateGatewayError({
+    status: 500,
+    bodyText,
+    modelName: "Qwen3.8 Flash Next (WeThink DGX Spark x2)",
+    providerName: "LiteLLM",
+  });
+  assert.match(payload.error.message, /rendered prompt exceeds the model's context window/);
+  assert.doesNotMatch(payload.error.message, /0 tokens/);
+  assert.equal(payload.error.code, "context_length_exceeded");
+});
+
+test("a LiteLLM prompt-count rejection reports input tokens, not requested output tokens", () => {
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        "litellm.BadRequestError: ContextWindowExceededError: This model's maximum context length is 262144 tokens. However, you requested 0 output tokens and your prompt contains at least 262145 input tokens, for a total of at least 262145 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=262145)",
+    },
+  });
+
+  const failure = contextLengthFailure(bodyText);
+  assert.equal(failure.inputTokens, 262145);
+  assert.equal(failure.maximumTokens, 262144);
+  assert.match(failure.detail, /prompt contains at least 262145 input tokens/);
+
+  const payload = translateGatewayError({
+    status: 400,
+    bodyText,
+    modelName: "Qwen3.8 Flash Next (WeThink DGX Spark x2)",
+    providerName: "LiteLLM",
+  });
+  assert.match(payload.error.message, /262,145 tokens/);
+  assert.match(payload.error.message, /262,144-token context window/);
+  assert.doesNotMatch(payload.error.message, /0 tokens/);
+  assert.equal(payload.error.code, "context_length_exceeded");
+});
+
 test("ordinary Ollama-style 500 errors remain retryable server errors", () => {
   const bodyText = JSON.stringify({ error: { message: "mlx runner stopped unexpectedly" } });
   assert.equal(gatewayErrorStatus({ status: 500, bodyText }), 500);

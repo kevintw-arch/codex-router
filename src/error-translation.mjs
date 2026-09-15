@@ -123,6 +123,7 @@ function isOutOfUsage(detail, errorType) {
 const CONTEXT_LENGTH_PATTERNS = [
   /input length \((\d+) tokens\) exceeds the model's maximum context length \((\d+) tokens\)/i,
   /input after truncation exceeds (?:the )?maximum context length/i,
+  /maximum context length (?:is|of) (\d+)(?: tokens?)?[\s\S]{0,240}?prompt contains (?:at least )?(\d+)(?: input)? tokens?/i,
   /maximum context length (?:is|of) (\d+)(?: tokens?)?.{0,80}(?:input|request).{0,40}(\d+)/i,
   /context[_\s-]length[_\s-]exceeded/i,
 ];
@@ -134,17 +135,24 @@ export function contextLengthFailure(bodyText) {
     const match = detail.match(pattern);
     if (!match) continue;
     if (pattern === CONTEXT_LENGTH_PATTERNS[0]) {
+      const inputTokens = Number(match[1]);
+      const maximumTokens = Number(match[2]);
       return {
         detail,
-        inputTokens: Number(match[1]),
-        maximumTokens: Number(match[2]),
+        // A zero rendered-input count is impossible for a rejected non-empty
+        // request. Keep the classification, but do not expose it as a real
+        // measurement to Codex or the operator.
+        ...(inputTokens > 0 ? { inputTokens } : {}),
+        ...(maximumTokens > 0 ? { maximumTokens } : {}),
       };
     }
-    if (pattern === CONTEXT_LENGTH_PATTERNS[2]) {
+    if (pattern === CONTEXT_LENGTH_PATTERNS[2] || pattern === CONTEXT_LENGTH_PATTERNS[3]) {
+      const inputTokens = Number(match[2]);
+      const maximumTokens = Number(match[1]);
       return {
         detail,
-        inputTokens: Number(match[2]),
-        maximumTokens: Number(match[1]),
+        ...(inputTokens > 0 ? { inputTokens } : {}),
+        ...(maximumTokens > 0 ? { maximumTokens } : {}),
       };
     }
     return { detail };

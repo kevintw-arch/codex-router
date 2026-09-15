@@ -2292,9 +2292,53 @@ function extractUserMessages(input) {
   return messages;
 }
 
+// A compaction request is allowed to throw away the ordinary transcript: the
+// deterministic source catalog already carries the bounded, typed evidence
+// that `finalizeCheckpoint` will accept. Keeping the full history in the
+// summarizer request is normally useful, but once it approaches the selected
+// model's context window it creates a deadlock -- the request whose job is to
+// shrink the history is itself rejected before the model can answer.
+const COMPACTION_REPLAY_CHAR_BUDGET = 80_000;
+const COMPACTION_INPUT_SAFETY_RATIO = 0.8;
+
+function boundedCompactionUserItems(input) {
+  const selected = [];
+  let remaining = COMPACTION_REPLAY_CHAR_BUDGET;
+  const messages = extractUserMessages(input);
+  for (let index = messages.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const value = messages[index];
+    if (value.length > remaining) break;
+    selected.push(value);
+    remaining -= value.length;
+  }
+  selected.reverse();
+  return selected.map(messageItem);
+}
+
+function compactionInputNeedsBounding(route, providerInput, catalogText) {
+  const contextWindow = Number(route?.contextWindow);
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) return false;
+  const input = [
+    ...(Array.isArray(providerInput) ? providerInput : [providerInput]),
+    messageItem(catalogText),
+    messageItem(COMPACTION_PROMPT),
+  ];
+  const estimatedTokens = estimateInputTokens(
+    JSON.stringify({ model: route.gatewayModel, tools: [], input }),
+    { contextWindow },
+  );
+  if (!Number.isFinite(estimatedTokens)) return false;
+  const declaredAutoCompact = Number(route.autoCompact);
+  const safetyThreshold = Math.floor(contextWindow * COMPACTION_INPUT_SAFETY_RATIO);
+  const autoCompactThreshold = Number.isFinite(declaredAutoCompact) && declaredAutoCompact > 0
+    ? Math.min(declaredAutoCompact, contextWindow)
+    : contextWindow;
+  return estimatedTokens >= Math.min(safetyThreshold, autoCompactThreshold);
+}
+
 // The v1 compact response shape follows Codex's replacement-history contract.
 function compactOutput(input, checkpoint) {
-  const budget = 80_000;
+  const budget = COMPACTION_REPLAY_CHAR_BUDGET;
   const selected = [];
   let remaining = budget;
   // Older requirements survive through bounded KCR2 evidence, not as stale
@@ -2443,8 +2487,22 @@ async function summarizeWith(
         new Map(),
       ).input
       : compatibleInput;
+  const instructions = [
+    messageItem(prepared.catalogText),
+    messageItem(COMPACTION_PROMPT),
+  ];
+  const bounded = compactionInputNeedsBounding(route, providerInput, prepared.catalogText);
+  const compactionInput = bounded
+    ? [...boundedCompactionUserItems(aged.input), ...instructions]
+    : [...providerInput, ...instructions];
+  if (bounded && !QUIET) {
+    console.error(
+      `[codex-router] compaction input bounded model=${route.slug} ` +
+        `contextWindow=${route.contextWindow} replayChars<=${COMPACTION_REPLAY_CHAR_BUDGET}`,
+    );
+  }
   const bridged = await bridgeVisionInput(
-    providerInput,
+    compactionInput,
     route,
     request,
   );
@@ -2456,11 +2514,7 @@ async function summarizeWith(
     // xAI rejects tool_choice "none" paired with it, so the field is omitted
     // rather than sent redundantly.
     tools: [],
-    input: [
-      ...bridged,
-      messageItem(prepared.catalogText),
-      messageItem(COMPACTION_PROMPT),
-    ],
+    input: [...bridged],
   };
   delete body.tool_choice;
   normalizeAutoToolChoice(body, route);
@@ -2488,7 +2542,12 @@ async function summarizeWith(
     body: serialized,
     signal,
   });
-  return { upstream, bridged, bytes: Buffer.byteLength(serialized, "utf8") };
+  return {
+    upstream,
+    bridged,
+    bytes: Buffer.byteLength(serialized, "utf8"),
+    bounded,
+  };
 }
 
 async function summarize(request, payload, route, signal, { allowFailover = true } = {}) {
