@@ -256,6 +256,22 @@ Report zero-token responses to the provider; only they can fix the source. To
 see the provider's own numbers in Codex again, set
 `CODEX_ROUTER_ZERO_INPUT_ESTIMATE=0` in the service environment.
 
+## A routed `/compact` request itself exceeds the provider context window
+
+The router now guards the compaction request separately from ordinary turns.
+When the estimated serialized input reaches the smaller of 80% of the route's
+`contextWindow` or its `autoCompact` limit, it sends a bounded replay: the
+latest complete user messages up to 80,000 characters, the bounded deterministic
+source catalog, and the compaction instructions. Below that threshold the full
+transcript is preserved. The router logs the decision as
+`compaction input bounded`; this prevents a `262145`-token compaction request
+from being rejected by a `262144`-token provider before a checkpoint exists.
+
+This guard does not change the provider's hard limit or make an already-open
+client projection forget its old error. After a router update, retry `/compact`
+once; if the client still replays a cached failure, start a new task with a
+short handoff rather than resending the complete over-limit history.
+
 ## A session compacts on every turn instead of getting work done
 
 The same substitution read against a window that is too small. Check what the

@@ -1860,8 +1860,13 @@ model you originally asked for. Nothing is written into your transcript — Code
 replays assistant output back as input, so a note from the router would come
 back next turn as a sentence the model thinks it wrote.
 
-Compaction gets the same treatment: a compaction that cannot run ends a long
-session just as surely as a turn that cannot run.
+Compaction gets the same treatment. When a routed `/compact` request is close
+to the selected route's context limit, the router sends a bounded replay of the
+latest complete user messages plus its deterministic catalog and compaction
+instructions instead of forwarding the full aged transcript. Smaller
+compactions keep the full transcript. A compaction that still fails for a
+provider or runtime reason ends a long session just as surely as a turn that
+cannot run.
 
 Note: your signed-in ChatGPT plan is **not** currently used as a fallback tier.
 Routed models fall back to other routed models only.
