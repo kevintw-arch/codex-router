@@ -45,6 +45,7 @@ Providers and models
   local-mlx         Install or inspect the supported local MLX model
 
 Maintenance
+  repair-stale-wethink  Inspect or abort stale Wethink requests without restarting DGX
   update            Update the installation (Git checkouts only)
   rollback          Restore the previously installed revision
   enable            Re-apply the Codex configuration
@@ -80,6 +81,10 @@ esac
 # `install` is deliberately absent. It is the installer that `install.sh` and
 # `update` drive, it rewrites the very directory it lives in, and a packaged
 # install has no writable one to rewrite.
+if [ "$command" = repair-stale-wethink ]; then
+  exec "$bin_dir/control" repair-stale-wethink "$@"
+fi
+
 if [ "$command" = install ] || [ ! -x "$bin_dir/$command" ]; then
   echo "codex-router: unknown command: $command" >&2
   echo "Run 'codex-router help' for the available commands." >&2

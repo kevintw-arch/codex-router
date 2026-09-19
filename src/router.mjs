@@ -103,6 +103,10 @@ import {
 } from "./response-usage.mjs";
 import { fetchWithRetry } from "./upstream-retry.mjs";
 import {
+  normalizeRepairOptions,
+  staleWethinkCandidates,
+} from "./stale-request-repair.mjs";
+import {
   NamespaceToolCallTransform,
   agentMessagesAsUserMessages,
   bridgeCustomTools,
@@ -129,6 +133,7 @@ import {
   MAX_FAILOVER_HOPS,
   classifyRoutedFailure,
   clearProviderCooldown,
+  filterAutomaticCompactionFailoverModels,
   providerCooldown,
   rankFailoverCandidates,
   readFailoverSettings,
@@ -311,6 +316,59 @@ export const MAX_ACTIVE_REQUESTS =
   Number.isFinite(configuredActiveRequests) && configuredActiveRequests > 0
     ? Math.floor(configuredActiveRequests)
     : 64;
+// The two DGX Spark nodes are serving one TP=2 Wethink runtime with
+// MAX_NUM_SEQS=3. Keep the same admission limit at the Router boundary so
+// traffic above the proven backend capacity gets an immediate, actionable
+// response instead of a multi-minute apparent hang.
+const configuredWethinkMaxInFlight = Number(
+  process.env.MODEL_ROUTER_WETHINK_MAX_INFLIGHT ||
+    process.env.CODEX_ROUTER_WETHINK_MAX_INFLIGHT ||
+    3,
+);
+export const WETHINK_MAX_INFLIGHT =
+  Number.isFinite(configuredWethinkMaxInFlight) && configuredWethinkMaxInFlight > 0
+    ? Math.floor(configuredWethinkMaxInFlight)
+    : 3;
+const providerInFlight = new Map();
+
+function acquireProviderSlot(providerId, { priority = false } = {}) {
+  const provider = canonicalProviderId(providerId);
+  if (provider !== "wethink") return () => {};
+  const active = providerInFlight.get(provider) || 0;
+  // Remote compaction is the recovery path that frees a long Session. Allow
+  // one compact turn to use a priority overflow slot; otherwise the guard can
+  // reject the very request needed to reduce the two occupied contexts.
+  const effectiveLimit = WETHINK_MAX_INFLIGHT + (priority ? 1 : 0);
+  if (active >= effectiveLimit) {
+    const error = new Error(
+      `The ${provider} provider is busy (${active}/${effectiveLimit} active requests). Retry shortly.`,
+    );
+    error.status = 429;
+    error.code = "ERR_PROVIDER_CONCURRENCY_LIMIT";
+    error.provider = provider;
+    error.limit = effectiveLimit;
+    error.active = active;
+    throw error;
+  }
+  providerInFlight.set(provider, active + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const remaining = (providerInFlight.get(provider) || 1) - 1;
+    if (remaining > 0) providerInFlight.set(provider, remaining);
+    else providerInFlight.delete(provider);
+  };
+}
+
+function providerConcurrencyPayload() {
+  return {
+    wethink: {
+      active: providerInFlight.get("wethink") || 0,
+      max: WETHINK_MAX_INFLIGHT,
+    },
+  };
+}
 // This bounds only the tray's activity records. It must not cancel an operation
 // or release its admission slot: a healthy SSE turn can outlive presentation
 // bookkeeping and still retain real buffers and an upstream connection.
@@ -415,6 +473,7 @@ function resourceLimitsPayload() {
   return {
     inFlightRequests: inFlightRequests.size,
     maxActiveRequests: MAX_ACTIVE_REQUESTS,
+    providerConcurrency: providerConcurrencyPayload(),
     activityRecordRetentionMs: ACTIVITY_RECORD_RETENTION_MS,
     requestExecutionTimeoutMs: REQUEST_EXECUTION_TIMEOUT_MS,
     maxDecodedBodyBytes: MAX_DECODED_BODY_BYTES,
@@ -444,6 +503,12 @@ function beginRequestActivity({ request, response, controller } = {}) {
   }
   const requestId = ++requestSequence;
   const startedAt = Date.now();
+  const inFlightEntry = {
+    requestId,
+    startedAt,
+    controller,
+    clientGone: false,
+  };
   let finished = false;
   let deadlineExceeded = false;
   let executionTimer;
@@ -472,9 +537,21 @@ function beginRequestActivity({ request, response, controller } = {}) {
     REQUEST_EXECUTION_TIMEOUT_MS + 1,
   );
   executionTimer.unref?.();
-  inFlightRequests.set(requestId, { startedAt });
+  inFlightRequests.set(requestId, inFlightEntry);
   activityRecords.set(requestId, { startedAt });
   return {
+    update(details = {}) {
+      const current = inFlightRequests.get(requestId);
+      if (current) Object.assign(current, details);
+      const activityRecord = activityRecords.get(requestId);
+      if (activityRecord) activityRecords.set(requestId, { ...activityRecord, ...details });
+    },
+    markClientGone() {
+      this.update({ clientGone: true, clientGoneAt: Date.now() });
+    },
+    repairRequested() {
+      return inFlightRequests.get(requestId)?.repairRequested === true;
+    },
     setRoute({ provider, model, sessionName, ...metadata } = {}) {
       if (!provider || finished) return;
       // Once presentation bookkeeping expires, later route updates must not
@@ -490,6 +567,15 @@ function beginRequestActivity({ request, response, controller } = {}) {
         startedAt,
       };
       activityRecords.set(requestId, entry);
+      const current = inFlightRequests.get(requestId);
+      if (current) {
+        Object.assign(current, {
+          provider,
+          ...(model ? { model } : {}),
+          ...(sessionName ? { sessionName } : {}),
+          ...metadata,
+        });
+      }
       lastUsedProvider = provider;
       if (model) lastUsedModel = model;
       if (sessionName) lastUsedSessionName = sessionName;
@@ -1272,6 +1358,68 @@ async function healthPayload() {
     grokOauth,
     gateway,
   };
+}
+
+// This endpoint is intentionally behind two local capabilities: the caller
+// path capability and the router's internal service key. It is a maintenance
+// action that can abort upstream work, so a normal model caller must never be
+// able to invoke it accidentally.
+async function handleWethinkStaleRepair(request, response) {
+  const presentedInternalKey = request.headers["x-codex-router-internal-key"];
+  if (
+    typeof presentedInternalKey !== "string" ||
+    !secretEqual(presentedInternalKey, INTERNAL_KEY || "")
+  ) {
+    writeJson(response, 403, {
+      error: {
+        type: "repair_authorization_required",
+        message: "The stale-request repair endpoint requires the local internal key.",
+      },
+    });
+    return;
+  }
+  const encoded = await readRequestBody(request, { maxBytes: 64 * 1024 });
+  const payload = encoded.length ? await parseBodyAsync(encoded) : {};
+  const apply = payload.apply === true;
+  const options = normalizeRepairOptions({
+    maxAgeMs: payload.maxAgeMs,
+    clientGoneGraceMs: payload.clientGoneGraceMs,
+  });
+  const entries = [...inFlightRequests.values()];
+  const candidates = staleWethinkCandidates(entries, options);
+  const applied = [];
+  if (apply) {
+    for (const candidate of candidates) {
+      const entry = candidate.entry;
+      const reason = new Error(`Wethink stale request repair: ${candidate.reason}`);
+      reason.code = "ERR_ROUTER_STALE_REQUEST_REPAIR";
+      entry.repairRequested = true;
+      entry.repairReason = candidate.reason;
+      try {
+        entry.controller?.abort(reason);
+        applied.push({ ...candidate.summary, reason: candidate.reason });
+      } catch {
+        // A request can finish between the snapshot and abort. It is already
+        // gone from the live operation by the time this happens.
+      }
+    }
+  }
+  writeJson(response, 200, {
+    ok: true,
+    mode: apply ? "apply" : "dry-run",
+    options: {
+      maxAgeMs: options.maxAgeMs,
+      clientGoneGraceMs: options.clientGoneGraceMs,
+    },
+    inFlightRequests: inFlightRequests.size,
+    candidateCount: candidates.length,
+    candidates: candidates.map((candidate) => ({
+      ...candidate.summary,
+      reason: candidate.reason,
+    })),
+    applied,
+    appliedCount: applied.length,
+  });
 }
 
 // Generic providers are enabled by their own explicit descriptor and never
@@ -2430,15 +2578,38 @@ function extractResponseText(payload) {
 // The models a compaction may be tried on, best first, without sending
 // anything. The conversation's own model leads unless it has already said it
 // is empty, in which case asking it again only buys the same rejection.
+//
+// Compaction is a recovery operation, not a new model-selection decision. A
+// stale remote compact request can arrive after the user changed the Session
+// model; allowing the automatic candidate sorter to pick a subscription OAuth
+// route here turns that stale request into an unrelated provider call. Keep
+// Grok out of *automatic* compaction failover by default. An operator may still
+// opt it in explicitly with `failover chain`, and an explicitly selected Grok
+// route remains the first attempt for that Session.
+const COMPACTION_FAILOVER_EXCLUDED_PROVIDERS = new Set(
+  String(process.env.MODEL_ROUTER_COMPACTION_FAILOVER_EXCLUDE_PROVIDERS || "grok-oauth")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
+
 function compactionAttempts(route, aged, searchContract, { allowFailover = true } = {}) {
   if (!allowFailover) return [route];
   const settings = readFailoverSettings();
   if (!settings.enabled) return [route];
+  const explicitChain = Array.isArray(settings.chain) && settings.chain.length > 0;
+  const configuredCandidates = selectedConfiguredListedModels().filter((model) => (
+    !readHiddenModels().has(model.slug) &&
+    !isDirectResponsesProvider(providerForModel(model))
+  ));
+  const candidatePool = explicitChain
+    ? configuredCandidates
+    : filterAutomaticCompactionFailoverModels(
+      configuredCandidates,
+      [...COMPACTION_FAILOVER_EXCLUDED_PROVIDERS],
+    );
   const candidates = rankFailoverCandidates(
-    selectedConfiguredListedModels().filter((model) => (
-      !readHiddenModels().has(model.slug) &&
-      !isDirectResponsesProvider(providerForModel(model))
-    )),
+    candidatePool,
     {
       from: route,
       // The transcript being summarized is nearly all of the request, so its
@@ -3554,8 +3725,10 @@ async function handleResponses(request, response, requestUrl) {
   let finalStatus;
   let activityStatus;
   let usageRecorded = false;
+  let releaseProviderSlot = () => {};
   bindClientAbort(request, response, () => {
     clientGone = true;
+    activity.markClientGone();
     controller.abort();
   });
   try {
@@ -3613,11 +3786,23 @@ async function handleResponses(request, response, requestUrl) {
       : false;
     const compactV1 = /\/responses\/compact$/.test(requestUrl.pathname);
     // Codex remote compaction V2 uses the ordinary Responses endpoint with a
-    // terminal trigger. Detect the protocol shape before route dispatch so the
-    // native path can also preserve the full tool results being summarized.
+    // terminal trigger. Detect it before admission so compaction can use the
+    // one priority overflow slot when ordinary Wethink turns are full.
     const compactV2 =
       Array.isArray(payload.input) &&
       payload.input.at(-1)?.type === "compaction_trigger";
+    activity.update({
+      requestKind: compactV1 || compactV2 ? "compaction" : "response",
+      isCompaction: compactV1 || compactV2,
+    });
+    if (route && !directResponses) {
+      // Hold the slot across compaction, the primary upstream request, and a
+      // possible empty-completion retry. This is one logical turn, and the
+      // DGX runtime's MAX_NUM_SEQS applies to that whole turn.
+      releaseProviderSlot = acquireProviderSlot(route.provider, {
+        priority: compactV1 || compactV2,
+      });
+    }
 
     if (route && !directResponses && (compactV1 || compactV2)) {
       const compaction = await handleRoutedCompaction(
@@ -4459,6 +4644,33 @@ async function handleResponses(request, response, requestUrl) {
       usageRecorded = true;
       return;
     }
+    if (
+      error?.code === "ERR_PROVIDER_CONCURRENCY_LIMIT" &&
+      !response.headersSent
+    ) {
+      finalStatus = error.status || 429;
+      activityStatus = finalStatus;
+      response.setHeader("Retry-After", "5");
+      writeJson(response, finalStatus, {
+        error: {
+          type: "provider_busy",
+          code: error.code,
+          provider: error.provider,
+          active: error.active,
+          limit: error.limit,
+          message: error.message,
+        },
+      });
+      recordUsageEvent({
+        model: route?.slug || requestedModel,
+        provider: route ? canonicalProviderId(route.provider) : "openai",
+        status: finalStatus,
+        durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+      });
+      usageRecorded = true;
+      return;
+    }
     if (error?.code === "model_search_not_supported" && !response.headersSent) {
       finalStatus = error.status;
       activityStatus = error.status;
@@ -4530,7 +4742,7 @@ async function handleResponses(request, response, requestUrl) {
     }
     // A client that walked away (canceled generation, closed stream) is not
     // a router failure; only surface errors the router or upstream produced.
-    if (clientGone) {
+    if (clientGone || activity.repairRequested()) {
       // Once the retry has started, a disconnect can make its outcome
       // unknowable. Do not report the first attempt's empty classification as
       // the terminal outcome of a turn the client canceled mid-retry.
@@ -4585,6 +4797,7 @@ async function handleResponses(request, response, requestUrl) {
     }
     throw error;
   } finally {
+    releaseProviderSlot();
     const status = activityStatus ?? finalStatus ?? response.statusCode;
     activity.finish(status);
     // Timestamped per-request timing for latency diagnosis. Never gated on
@@ -4613,6 +4826,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
   let servingProvider = "openai";
   bindClientAbort(request, response, () => {
     clientGone = true;
+    activity.markClientGone();
     controller.abort();
   });
   try {
@@ -4849,6 +5063,7 @@ async function handleEmbeddings(request, response, requestUrl) {
   let status = 0;
   bindClientAbort(request, response, () => {
     clientGone = true;
+    activity.markClientGone();
     controller.abort();
   });
   try {
@@ -4997,6 +5212,11 @@ async function handleRequest(request, response) {
     return;
   }
   requestUrl.pathname = route;
+
+  if (request.method === "POST" && route === "/v1/admin/repair/wethink") {
+    await handleWethinkStaleRepair(request, response);
+    return;
+  }
 
   // Behind the caller capability, like every other local endpoint: the panel
   // reads the same data the tray does, so it is gated the same way.

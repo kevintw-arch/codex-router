@@ -1868,6 +1868,17 @@ compactions keep the full transcript. A compaction that still fails for a
 provider or runtime reason ends a long session just as surely as a turn that
 cannot run.
 
+Automatic compact recovery is deliberately narrower than ordinary-turn
+failover. `grok-oauth` is excluded from the automatic compaction candidate pool
+by default, so a stale compact request cannot silently turn a DeepSeek/Qwen
+session into a Grok request. An operator who intentionally wants Grok in that
+recovery path can name it in `./bin/control failover chain`; the explicit chain
+is an opt-in and is not filtered by this guard. The exclusion can be changed
+for a managed install with `MODEL_ROUTER_COMPACTION_FAILOVER_EXCLUDE_PROVIDERS`
+(comma-separated provider ids). This does not cancel a compact task that the
+Codex client already submitted with a stale model; the client must invalidate
+that task when the Session model changes.
+
 Note: your signed-in ChatGPT plan is **not** currently used as a fallback tier.
 Routed models fall back to other routed models only.
 
@@ -2405,6 +2416,32 @@ Codex still owns the agent loop, tools, permissions, files, plugins,
 skills, MCP servers, and conversation state. The router handles model inference
 and protocol translation; it cannot add a capability the selected model or
 provider does not implement.
+
+### Repairing stale Wethink requests
+
+When a Codex window is stopped while a compaction or generation request is
+still being relayed, the client-side stop is not always visible to LiteLLM or
+the DGX backend. The router therefore exposes a conservative, local repair
+command:
+
+```sh
+# Inspect candidates only; this is the default and changes nothing.
+./bin/control repair-stale-wethink
+
+# Abort only candidates that meet the stale rules.
+./bin/control repair-stale-wethink --apply
+```
+
+The repair is limited to the `wethink` provider. A request must be older than
+the configured safety age (five minutes by default) and either have a departed
+client, be an older compaction superseded by a newer request on the same
+Codex thread, or be a compaction that has exceeded that safety age while its
+client is still waiting. This last rule prevents a connected-but-wedged
+compaction from holding a provider slot forever. Different sessions and
+parallel subagents are kept separate.
+The endpoint also requires the router's internal key, in addition to the
+caller capability. A Router reload is required before this new command is
+available; it does not restart DGX or clear active model work by itself.
 
 ## Add future providers and models
 

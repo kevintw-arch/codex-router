@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { pickerCommandArgs } from "./control-args.mjs";
 import { readControlHealth } from "./control-health.mjs";
+import { repairStaleWethink } from "./stale-request-repair.mjs";
 import { nativeSubagentCertification, promoteNativeMultiAgent } from "./catalog.mjs";
 import {
   applyModelOverlayPublication,
@@ -3308,6 +3309,31 @@ async function printHealth() {
   process.stdout.write(`${JSON.stringify(await readControlHealth())}\n`);
 }
 
+async function repairStaleWethinkFromControl() {
+  const rawMaxAge = optionValue("--max-age-ms");
+  const rawGrace = optionValue("--client-gone-grace-ms");
+  if (rawMaxAge !== undefined && !/^\d+$/.test(rawMaxAge)) {
+    throw new Error("Usage: control repair-stale-wethink [--apply] [--max-age-ms N] [--client-gone-grace-ms N]");
+  }
+  if (rawGrace !== undefined && !/^\d+$/.test(rawGrace)) {
+    throw new Error("Usage: control repair-stale-wethink [--apply] [--max-age-ms N] [--client-gone-grace-ms N]");
+  }
+  const result = await repairStaleWethink({
+    apply: args.includes("--apply"),
+    ...(rawMaxAge !== undefined ? { maxAgeMs: Number(rawMaxAge) } : {}),
+    ...(rawGrace !== undefined ? { clientGoneGraceMs: Number(rawGrace) } : {}),
+  });
+  const reported = result.status === 404
+    ? {
+      ...result,
+      error: "目前執行中的 Router 尚未載入 stale-request repair；需要一次 Router reload。",
+      next: "./bin/control service restart",
+    }
+    : result;
+  process.stdout.write(`${JSON.stringify(reported)}\n`);
+  if (!reported.ok) process.exitCode = 1;
+}
+
 // --- dispatch ---------------------------------------------------------------
 
 if (args.includes("--probe")) {
@@ -3404,6 +3430,8 @@ if (args.includes("--probe")) {
   await handleChatGptAccountSwitch(args[1], args[2], args[3]);
 } else if (args[0] === "health") {
   await printHealth();
+} else if (args[0] === "repair-stale-wethink") {
+  await repairStaleWethinkFromControl();
 } else if (args[0] === "maintenance") {
   await updateAndVerifyCodex();
 } else if (args[0] === "doctor") {
