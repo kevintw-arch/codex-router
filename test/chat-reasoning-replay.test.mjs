@@ -4,6 +4,7 @@ import { pipeline } from "node:stream/promises";
 import test from "node:test";
 
 import {
+  createReasoningReplayJsonTap,
   createReasoningReplayTap,
   reasoningForToolCalls,
   reasoningReplayCacheStats,
@@ -111,6 +112,64 @@ test("the tap stays silent for a turn with no tool calls", async () => {
   const { seen } = await runTap(sse);
   assert.deepEqual(seen, []);
   assert.equal(reasoningReplayCacheStats().entries, 0);
+});
+
+async function runJsonTap(body) {
+  const source = Buffer.from(body);
+  const seen = [];
+  const out = [];
+  await pipeline(
+    Readable.from([source.subarray(0, 13), source.subarray(13)]),
+    createReasoningReplayJsonTap({ onStore: (event) => seen.push(event) }),
+    new Writable({ write(chunk, _encoding, callback) { out.push(Buffer.from(chunk)); callback(); } }),
+  );
+  assert.deepEqual(Buffer.concat(out), source, "JSON tap changed response bytes");
+  return seen;
+}
+
+test("complete JSON tool-call reasoning is available for the next turn", async () => {
+  resetReasoningReplayCache();
+  const seen = await runJsonTap(JSON.stringify({ choices: [{
+    finish_reason: "tool_calls",
+    message: { reasoning_content: "complete thought", tool_calls: [{ id: "call_json" }] },
+  }] }));
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].stored, 1);
+  assert.equal(reasoningForToolCalls(["call_json"]), "complete thought");
+});
+
+test("JSON tap skips incomplete, malformed, empty-reasoning, and oversized responses", async () => {
+  resetReasoningReplayCache();
+  for (const body of [
+    '{"choices":',
+    JSON.stringify({ choices: [{ finish_reason: "length", message: { reasoning_content: "partial", tool_calls: [{ id: "call_length" }] } }] }),
+    JSON.stringify({ choices: [{ finish_reason: "tool_calls", message: { reasoning_content: "", tool_calls: [{ id: "call_empty" }] } }] }),
+    JSON.stringify({ choices: [{ finish_reason: "tool_calls", message: { reasoning_content: "x".repeat(4 * 1024 * 1024), tool_calls: [{ id: "call_oversize" }] } }] }),
+  ]) assert.deepEqual(await runJsonTap(body), []);
+  for (const id of ["call_length", "call_empty", "call_oversize"]) {
+    assert.equal(reasoningForToolCalls([id]), undefined);
+  }
+});
+
+test("JSON tap rejects invalid UTF-8 rather than storing changed reasoning", async () => {
+  resetReasoningReplayCache();
+  const prefix = Buffer.from('{"choices":[{"finish_reason":"tool_calls","message":{"reasoning_content":"');
+  const suffix = Buffer.from('","tool_calls":[{"id":"call_invalid_utf8"}]}}]}');
+  assert.deepEqual(await runJsonTap(Buffer.concat([prefix, Buffer.from([0xff]), suffix])), []);
+  assert.equal(reasoningForToolCalls(["call_invalid_utf8"]), undefined);
+});
+
+test("JSON tap captures successful later choices without storing incomplete choices", async () => {
+  resetReasoningReplayCache();
+  const seen = await runJsonTap(JSON.stringify({ choices: [
+    { finish_reason: "length", message: { reasoning_content: "partial", tool_calls: [{ id: "call_partial" }] } },
+    { finish_reason: "tool_calls", message: { reasoning_content: "second thought", tool_calls: [{ id: "call_second" }] } },
+    { finish_reason: "tool_calls", message: { reasoning_content: "third thought", tool_calls: [{ id: "call_third" }] } },
+  ] }));
+  assert.equal(seen.length, 2);
+  assert.equal(reasoningForToolCalls(["call_partial"]), undefined);
+  assert.equal(reasoningForToolCalls(["call_second"]), "second thought");
+  assert.equal(reasoningForToolCalls(["call_third"]), "third thought");
 });
 
 // The exact shape the forwarder produces: an assistant tool-call message whose

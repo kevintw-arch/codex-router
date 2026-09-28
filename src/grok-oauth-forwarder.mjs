@@ -50,6 +50,9 @@ import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 import { createGrokInflightGate, grokInflightLimit, responseWithInflightRelease } from "./grok-inflight.mjs";
 import { grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
+import {
+  certifiedReasoningItems, createReasoningCarryStore, reasoningCarryEnabled, reasoningCarryScope,
+} from "./grok-reasoning-carry.mjs";
 
 // This process carries only Grok traffic, so its whole pool outlasts the
 // router's stall guard. Undici's 300s default would otherwise end a long
@@ -68,6 +71,7 @@ const GROK_BASE = (
 const INTERNAL_KEY = process.env.MODEL_ROUTER_INTERNAL_KEY;
 const QUIET = process.env.MODEL_ROUTER_QUIET === "1";
 const PROGRESS_ONLY_RETRY = process.env.CODEX_ROUTER_GROK_PROGRESS_ONLY_RETRY !== "0";
+const reasoningCarry = reasoningCarryEnabled() ? createReasoningCarryStore() : undefined;
 const PROGRESS_ONLY_MAX_TEXT = envNonNegativeInt(
   "CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT",
   DEFAULT_PROGRESS_ONLY_MAX_TEXT,
@@ -366,6 +370,10 @@ export function toResponsesRequest(chat, options = {}) {
         output: normalizeToolOutputForGrok(message.content),
       });
     } else if (role === "assistant" && Array.isArray(message.tool_calls)) {
+      // xAI's own encrypted reasoning for this tool-calling turn, when the
+      // forwarder still holds it (see grok-reasoning-carry.mjs).
+      const carried = options.recallReasoning?.(message.tool_calls.map((call) => call?.id));
+      if (carried?.length) input.push(...carried);
       const text = contentToText(message.content);
       if (text) {
         input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text }] });
@@ -391,6 +399,7 @@ export function toResponsesRequest(chat, options = {}) {
   if (instructions) request.instructions = instructions;
   const effort = mapEffort(chat.reasoning_effort, chat.model);
   if (effort) request.reasoning = { effort };
+  if (effort && options.recallReasoning) request.include = ["reasoning.encrypted_content"];
   const clientTools = Array.isArray(chat.tools)
     ? chat.tools
         .filter((tool) => tool?.type === "function" && tool.function?.name)
@@ -578,7 +587,22 @@ async function handleChatCompletions(request, response) {
   const model = typeof chat.model === "string" ? chat.model : "";
   const hostedSearchEnabled = hostedSearchEnabledFor(model);
   const viewImageAlias = shouldAliasViewImageForGrok(chat);
-  const responsesRequest = toResponsesRequest(chat, { hostedSearchEnabled });
+  const conversationKey = conversationId(chat?.messages);
+  const carryScope = reasoningCarryScope(conversationKey, model);
+  const carryCounts = { hits: 0, misses: 0 };
+  const recallReasoning = reasoningCarry
+    ? (callIds) => {
+        const items = reasoningCarry.recall(carryScope, callIds);
+        carryCounts[items ? "hits" : "misses"]++;
+        return items;
+      }
+    : undefined;
+  const responsesRequest = toResponsesRequest(chat, { hostedSearchEnabled, recallReasoning });
+  if (carryCounts.misses && !QUIET) {
+    console.error(
+      `[grok-oauth] reasoning-carry hits=${carryCounts.hits} misses=${carryCounts.misses} model=${model}`,
+    );
+  }
   const holdOptions = {
     maxText: PROGRESS_ONLY_MAX_TEXT,
     minOutputTokens: PROGRESS_ONLY_MIN_OUTPUT_TOKENS,
@@ -587,7 +611,6 @@ async function handleChatCompletions(request, response) {
   const mayRetry =
     PROGRESS_ONLY_RETRY && (afterToolResult || requestOffersClientTools(chat));
   const strictAfterToolRepair = PROGRESS_ONLY_RETRY && afterToolResult;
-  const conversationKey = conversationId(chat?.messages);
   // Attempt 1 normally stays live. Once this exact conversation has actually
   // produced a progress-only stop, buffer only its next short visible prefix.
   // That prevents an aborted/retried turn from committing the same status
@@ -785,10 +808,14 @@ async function handleChatCompletions(request, response) {
     }
   };
 
+  const upstreamOutputItems = [];
   try {
     await consumeResponsesStream(upstream.body, (event) => {
       firstAttempt.firstEventAt ??= Date.now();
       applyResponsesEvent(turnState, event);
+      if (event?.type === "response.output_item.done" && event.item && !turnState.terminalStatus) {
+        upstreamOutputItems.push(event.item);
+      }
       emitPendingDeltas();
     });
     firstAttempt.endedAt = Date.now();
@@ -803,6 +830,9 @@ async function handleChatCompletions(request, response) {
   // deltas may already have reached the client; only one terminal error is
   // legal now. Withheld/backfilled deltas stay withheld on failure.
   if (rejectUnsuccessfulTurn(turn, "attempt", firstAttempt)) return;
+  // Only a completed response certifies its reasoning for the next request.
+  reasoningCarry?.remember(carryScope, turn.toolCalls.map((call) => call.id),
+    certifiedReasoningItems(upstreamOutputItems));
   emitPendingDeltas();
   let retried = false;
   let repairFailure;
@@ -819,7 +849,7 @@ async function handleChatCompletions(request, response) {
     };
   } else if (mayRetry && progressOnly) {
     const retryChat = withProgressOnlyNudge(chat, { afterToolResult });
-    const retryRequest = toResponsesRequest(retryChat, { hostedSearchEnabled });
+    const retryRequest = toResponsesRequest(retryChat, { hostedSearchEnabled, recallReasoning });
     let secondUpstream;
     try {
       repairAttempt = await requestUpstream(accessToken, retryRequest);
@@ -1037,6 +1067,7 @@ async function handleRequest(request, response) {
       ok: true,
       service: "codex-router-grok-oauth-forwarder",
       credential_present: credentialPresent,
+      reasoningCarry: reasoningCarry ? { version: 1, ...reasoningCarry.stats() } : null,
     });
     return;
   }

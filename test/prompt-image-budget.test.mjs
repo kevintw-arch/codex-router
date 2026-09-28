@@ -6,6 +6,8 @@ import {
   IMAGE_PAYLOAD_BUDGET_BYTES,
   IMAGE_PAYLOAD_BUDGET_TOKENS,
   IMAGE_PAYLOAD_KEEP_NEWEST,
+  isImagePayloadRejection,
+  tighterImageBudget,
 } from "../src/prompt-image-budget.mjs";
 
 // One decoded megabyte of image, as a data URL: the base64 is 4/3 of the decoded
@@ -155,4 +157,60 @@ test("an explicit maxTokens override is honoured", () => {
   const { stats } = boundImagePayload(input, { maxTokens: 5 * 4096 });
   assert.equal(stats.imageTokensAfter, 5 * 4096);
   assert.equal(stats.imageReferencesDropped, 5);
+});
+
+test("only a refusal that names image content is read as an image rejection", () => {
+  // OpenRouter's wording, as LiteLLM relays it.
+  const openRouter =
+    "litellm.APIError: APIError: OpenAIException - Downloaded image content cannot exceed 30MB.";
+  assert.equal(isImagePayloadRejection({ status: 413, bodyText: openRouter }), true);
+  assert.equal(
+    isImagePayloadRejection({ status: 400, bodyText: "Too many images in request: maximum is 100" }),
+    true,
+  );
+  assert.equal(
+    isImagePayloadRejection({ status: 400, bodyText: "image exceeds 5 MB maximum" }),
+    true,
+  );
+  // This router's own inbound frame limit is a 413 with nothing about images.
+  assert.equal(isImagePayloadRejection({ status: 413, bodyText: "Request body too large" }), false);
+  // Dropping screenshots cannot fix a model that takes none, or a quota.
+  assert.equal(
+    isImagePayloadRejection({ status: 400, bodyText: "This model does not support image input" }),
+    false,
+  );
+  assert.equal(isImagePayloadRejection({ status: 429, bodyText: openRouter }), false);
+  assert.equal(isImagePayloadRejection({ status: 413 }), false);
+});
+
+test("a refused payload is resent with half its images until only the newest are left", () => {
+  const input = messageWith(Array.from({ length: 10 }, () => imageOf(1)));
+  const first = boundImagePayload(input);
+  assert.equal(first.stats.imageReferencesDropped, 0);
+
+  const limits = tighterImageBudget(first.stats);
+  assert.ok(limits.maxBytes <= first.stats.imageBytesAfter / 2);
+  const second = boundImagePayload(input, limits);
+  assert.ok(second.stats.imageBytesAfter <= first.stats.imageBytesAfter / 2);
+  assert.ok(second.stats.imageReferencesDropped >= 5);
+
+  // Once only the protected newest images remain there is nothing to resend.
+  const floor = boundImagePayload(input, { maxBytes: 1 });
+  assert.equal(
+    floor.stats.imageReferencesSeen - floor.stats.imageReferencesDropped,
+    IMAGE_PAYLOAD_KEEP_NEWEST,
+  );
+  assert.equal(tighterImageBudget(floor.stats), undefined);
+  assert.equal(tighterImageBudget(undefined), undefined);
+});
+
+test("a tighter budget on a route with no per-image charge keeps the token check on", () => {
+  const input = messageWith(Array.from({ length: 6 }, () => imageOf(1)));
+  const { stats } = boundImagePayload(input, { tokensPerImage: 0 });
+  const limits = tighterImageBudget(stats);
+  assert.equal(limits.maxTokens, undefined);
+  // An undefined maxTokens falls back to the default budget rather than
+  // disabling it, and the byte half still trims.
+  const next = boundImagePayload(input, { ...limits, tokensPerImage: 0 });
+  assert.ok(next.stats.imageReferencesDropped > 0);
 });

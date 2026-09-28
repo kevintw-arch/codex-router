@@ -201,3 +201,41 @@ export function boundImagePayload(
     },
   };
 }
+
+// The budget above is a measurement of one provider on one day, not a contract.
+// A provider that counts differently, lowers its ceiling, or caps the number of
+// images rather than their size still refuses the request, and a refused
+// compaction is retried by the client before every following turn - the
+// session stalls for good. So a refusal that names image content is answered by
+// sending less of it, rather than by surfacing an error nobody can act on.
+//
+// Only a 400 or 413 whose body says an image was too large or too many counts:
+// a generic 413 is this router's own inbound frame limit, and a 400 about
+// anything else would not be fixed by dropping screenshots.
+const IMAGE_REJECTION = /\bimages?\b[^\n]{0,120}?\b(exceed|too large|too big|too many|maximum|limit|size)/i;
+
+export function isImagePayloadRejection({ status, bodyText } = {}) {
+  if (status !== 400 && status !== 413) return false;
+  return typeof bodyText === "string" && IMAGE_REJECTION.test(bodyText);
+}
+
+// How many times one request may be resent with fewer images. Each retry halves
+// what the last attempt carried, so two retries reach a quarter of it - well
+// under any ceiling the first attempt merely grazed - while a provider that
+// refuses even that still fails in bounded time.
+export const IMAGE_REJECTION_MAX_RETRIES = 2;
+
+// The budget for the next attempt after `stats` was refused, or undefined when
+// nothing more can go: every image left is one of the newest the budget never
+// drops, so resending would only repeat the refusal.
+export function tighterImageBudget(stats, { keepNewest = IMAGE_PAYLOAD_KEEP_NEWEST } = {}) {
+  if (!stats) return undefined;
+  const remaining = stats.imageReferencesSeen - stats.imageReferencesDropped;
+  if (remaining <= Math.max(0, keepNewest)) return undefined;
+  return {
+    maxBytes: Math.floor(stats.imageBytesAfter / 2),
+    // A route with no per-image charge reports zero tokens; halving that would
+    // read as "no budget" and disable the check, so keep the byte half only.
+    maxTokens: stats.imageTokensAfter > 0 ? Math.floor(stats.imageTokensAfter / 2) : undefined,
+  };
+}

@@ -35,6 +35,7 @@ import { Transform } from "node:stream";
 const MAX_ENTRIES = 512;
 const MAX_CHARS = 400_000;
 const MAX_TURN_CHARS = 400_000;
+const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 const byToolCall = new Map(); // tool_call id -> reasoning text, oldest first
 let storedChars = 0;
@@ -194,6 +195,47 @@ export function createReasoningReplayTap({ onStore } = {}) {
     },
     flush(callback) {
       finish();
+      callback();
+    },
+  });
+}
+
+// LiteLLM can request a non-streaming Chat Completions response for a Codex
+// Responses turn. Observe a complete successful JSON response without changing
+// its bytes; incomplete or oversized responses must never seed replay.
+export function createReasoningReplayJsonTap({ onStore } = {}) {
+  const chunks = [];
+  let bytes = 0;
+  let eligible = true;
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      if (eligible) {
+        bytes += chunk.length;
+        if (bytes <= MAX_JSON_RESPONSE_BYTES) chunks.push(Buffer.from(chunk));
+        else {
+          eligible = false;
+          chunks.length = 0;
+        }
+      }
+      callback(null, chunk);
+    },
+    flush(callback) {
+      if (eligible && bytes > 0) {
+        try {
+          const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, bytes));
+          const payload = JSON.parse(decoded);
+          if (!Array.isArray(payload?.choices)) throw new Error("missing choices");
+          for (const choice of payload.choices) {
+            if (choice?.finish_reason !== "tool_calls" && choice?.finish_reason !== "stop") continue;
+            const reasoning = choice.message?.reasoning_content;
+            const toolCallIds = collectToolCallIds(choice.message?.tool_calls);
+            const stored = rememberReasoningForToolCalls(toolCallIds, reasoning);
+            if (stored) onStore?.({ stored, chars: reasoning.length, toolCallIds });
+          }
+        } catch {
+          // Invalid JSON or UTF-8 cannot supply the model's exact reasoning.
+        }
+      }
       callback();
     },
   });

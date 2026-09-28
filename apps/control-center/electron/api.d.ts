@@ -189,6 +189,8 @@ export interface RouterControl {
   addCustomEndpoint(endpoint: { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses"; credential?: string }): Promise<{ providerId: string; check?: { ok: boolean; status: number; reason?: string } }>;
   editCustomEndpoint(provider: string, endpoint: { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses" }): Promise<{ providerId: string; check?: { ok: boolean; status: number; reason?: string } }>;
   removeCustomEndpointModels(provider: string, slugs: string[]): Promise<unknown>;
+  /** Prune locally curated models (the `user-models.json` overlay) on any provider. */
+  removeLocalModels(slugs: string[]): Promise<unknown>;
   addCustomEndpointModel(provider: string, modelId: string): Promise<unknown>;
   removeProviderCredential(provider: string): Promise<unknown>;
   setSubagentMode(mode: SubagentMode): Promise<unknown>;
