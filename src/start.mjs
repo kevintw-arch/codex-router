@@ -10,6 +10,7 @@ import {
   LITELLM_CONFIG_PATH,
   MERGED_CATALOG_PATH,
   PORTS,
+  PROVIDER_SELECTION_PATH,
   SOURCE_ROOT,
   STATE_DIR,
   TARGET,
@@ -17,6 +18,7 @@ import {
 } from "./paths.mjs";
 import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
+import { describeChildExit, fatalExitFollowUp } from "./fatal-exit.mjs";
 import { gatewaySupervisorLimits, superviseGateway } from "./gateway-supervisor.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
 import { MODELS } from "./model-registry.mjs";
@@ -35,12 +37,8 @@ import {
 } from "./proxy-environment.mjs";
 import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
 import { cursorTunnelRunSpec } from "./cursor-cloudflare-tunnel.mjs";
-import { PROVIDER_SELECTION_PATH } from "./paths.mjs";
-import {
-  configuredProviderIds,
-  disableProvider,
-  readProviderSelectionDetail,
-} from "./provider-selection.mjs";
+import { pruneUnconfiguredProviders } from "./provider-selection.mjs";
+import { targetCli } from "./target-integration.mjs";
 
 // Before anything reads the environment or spawns a child. A service manager
 // hands this process the proxy the install recorded; a shell hands it whatever
@@ -128,60 +126,24 @@ const callerKey = assertCallerSecret(
 );
 writeLiteLlmConfig();
 
-// Disabled-by-default guarantee: every provider the operator explicitly
-// enabled and no longer has a credential for is removed from the selection
-// file at this point. Without it, the catalog continues to advertise models
-// whose every request fails with "provider_api_key_missing" and the user
-// only learns from the log.
-//
-// Two buckets matter:
-//   - providers listed in enabled-providers.json that this build no longer
-//     recognises (version skew after an upgrade);
-//   - recognised providers without a credential.
-//
-// Both stay on disk; both the catalog and the on-disk file must agree about
-// what is routable. `readProviderSelectionDetail()` already separates the
-// two buckets; we disable from both before any forwarder can answer a turn
-// against an unconfigured endpoint. Idempotent: a provider that is already
-// absent is logged once and skipped.
-function pruneUnconfiguredProviders() {
-  let selection;
-  try {
-    selection = readProviderSelectionDetail();
-  } catch {
-    return;
-  }
-  if (!selection.providers.length && !selection.ignored?.length) return;
-  const configured = new Set(configuredProviderIds());
-  const removals = [
-    ...(selection.ignored || []).map((id) => ({ id, reason: "unrecognised" })),
-    ...selection.providers
-      .filter((id) => !configured.has(id))
-      .map((id) => ({ id, reason: "no credential" })),
-  ];
-  const removed = [];
-  for (const { id } of removals) {
-    try {
-      disableProvider(id);
-      removed.push(id);
-    } catch (error) {
-      console.error(
-        `[codex-router] could not auto-disable ${id}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-  if (removed.length) {
-    console.error(
-      `[codex-router] disabled ${removed.length} provider(s) from ${PROVIDER_SELECTION_PATH}: ${removed.join(", ")}`,
-    );
-    for (const _id of removed) {
-      console.error(
-        `[codex-router] run: codex-router setup (and re-pick the provider(s) above) to restore them.`,
-      );
-    }
-  }
+// Drop enabled providers this build cannot authenticate (missing credential,
+// retired/unknown id). Without this, enabled-providers.json accrues dead
+// entries and the next turn against them returns provider_api_key_missing
+// while the picker can still advertise a stale catalog row. Runs after the
+// gateway config write so a prune that rewrites selection cannot race a
+// concurrent config reader mid-start; forwarders spawned below see the
+// reconciled file.
+const prunedProviders = pruneUnconfiguredProviders();
+if (prunedProviders.length) {
+  console.error(
+    `[codex-router] pruned ${prunedProviders.length} provider(s) from ${PROVIDER_SELECTION_PATH}: ${
+      prunedProviders.map(({ id, reason }) => `${id} (${reason})`).join(", ")
+    }`,
+  );
+  console.error(
+    `[codex-router] restore with: ${targetCli("setup --guided")} or ${targetCli("providers enable <id>")} after storing a credential`,
+  );
 }
-pruneUnconfiguredProviders();
 
 // A checked local model means the operator intends to route through Ollama,
 // so keep its daemon available for the gateway. This never installs software
@@ -434,6 +396,16 @@ async function main() {
       undefined,
       child,
     );
+  // The watchdog's probe is deliberately short: it runs on a timer while the
+  // gateway is otherwise idle, so it must never park the supervisor for the
+  // cold-start budget `gatewayHealthy` is allowed.
+  const gatewayLivenessCheck = () =>
+    waitForHealth(
+      "LiteLLM gateway liveness",
+      loopback(PORTS.gateway, "/health/liveliness"),
+      {},
+      4_000,
+    );
   const gateway = startGateway();
   await gatewayHealthy(gateway);
 
@@ -448,6 +420,15 @@ async function main() {
     frontendService,
     router,
   );
+
+  // After router is healthy, refresh the native account catalog and check its
+  // cache plus the installed Codex binary for drift in the background.
+  // This runs async without blocking further startup or waiting for user commands.
+  import("./native-catalog-drift.mjs")
+    .then(({ republishOnNativeDrift }) => republishOnNativeDrift())
+    .catch((error) => {
+      console.error(`[codex-router] Native drift check failed: ${error.message}`);
+    });
 
   if (antigravityStartup.pendingActivationGeneration) {
     const promoted = await attemptAntigravityProbePromotionAfterReadiness({
@@ -515,6 +496,7 @@ async function main() {
       start: startGateway,
       waitForExit,
       waitForHealth: gatewayHealthy,
+      healthCheck: gatewayLivenessCheck,
       isShuttingDown: () => shuttingDown,
       log: (message) => console.error(`[${frontendService}] ${message}`),
       ...gatewaySupervisorLimits(),
@@ -522,9 +504,14 @@ async function main() {
     waitForExit(router, frontend.label),
   ]);
   if (!shuttingDown) {
+    // A Windows fatal status is named in the line itself (src/fatal-exit.mjs)
+    // and earns a capture pointer on the next one; every other exit renders
+    // exactly as before. Crash lines are never gated on CODEX_ROUTER_QUIET.
     console.error(
-      `[${frontendService}] ${result.label} exited (code=${String(result.code)}, signal=${String(result.signal)}).`,
+      `[${frontendService}] ${result.label} exited (${describeChildExit(result)}).`,
     );
+    const followUp = fatalExitFollowUp(result);
+    if (followUp) console.error(`[${frontendService}] ${followUp}`);
   }
   return result.code || 0;
 }

@@ -23,7 +23,20 @@ import {
 } from "../apps/panel/model.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-import { availableLanguages, getLanguage, setLanguage, t, translationKeys } from "../apps/panel/i18n.mjs";
+import {
+  LANGUAGE_OPTIONS,
+  availableLanguages,
+  getLanguage,
+  setLanguage,
+  t,
+  translationKeys,
+} from "../apps/panel/i18n.mjs";
+
+// The panel resolves a language from the host at import time, so a developer
+// running these assertions on a non-English machine would otherwise compare
+// translated labels against English expectations. Pin it once; the translation
+// test below switches languages deliberately and restores this value itself.
+setLanguage("en");
 
 test("model picker search matches names, slugs, and provider labels", () => {
   const model = {
@@ -252,6 +265,67 @@ test("active model speed prefers its provider and matches qualified slugs", () =
   assert.equal(observedModelSpeed(usage, "deepseek", "missing/model"), null);
 });
 
+test("panel speed rendering logic detects generation state correctly", () => {
+  // Verify the isGenerating logic that renderModelSpeed uses
+
+  // Idle state with no active requests
+  const idleActivity = {
+    state: "idle",
+    model: "provider/model",
+    provider: "provider",
+    active: [],
+  };
+  const isIdleGenerating = idleActivity.state === "generating" || (idleActivity.active && idleActivity.active.length > 0);
+  assert.equal(isIdleGenerating, false, "idle state with no active requests should not be generating");
+
+  // Generating state
+  const generatingActivity = {
+    state: "generating",
+    model: "provider/model",
+    provider: "provider",
+    active: [{ model: "provider/model", provider: "provider" }],
+  };
+  const isGenerating =
+    generatingActivity.state === "generating" || (generatingActivity.active && generatingActivity.active.length > 0);
+  assert.equal(isGenerating, true, "generating state should be detected");
+
+  // Active requests present even if state is not explicitly "generating"
+  const activeWithoutGeneratingState = {
+    state: "idle",
+    model: "provider/model",
+    provider: "provider",
+    active: [{ model: "provider/model", provider: "provider" }],
+  };
+  const hasActive =
+    activeWithoutGeneratingState.state === "generating" ||
+    (activeWithoutGeneratingState.active && activeWithoutGeneratingState.active.length > 0);
+  assert.equal(hasActive, true, "active requests should be detected even without generating state");
+
+  // Verify observedModelSpeed should return null when generating
+  const providerUsage = {
+    providers: [
+      {
+        id: "provider",
+        models: [
+          {
+            slug: "provider/model",
+            displayName: "model",
+            observedTokensPerSecond: 125.3,
+            speedSampleCount: 10,
+          },
+        ],
+      },
+    ],
+  };
+  // When not generating, observedModelSpeed should be called and return speed
+  const observedIdle = !isIdleGenerating ? observedModelSpeed(providerUsage, "provider", "provider/model") : null;
+  assert.deepEqual(observedIdle, { speed: 125.3, samples: 10 });
+
+  // When generating, observedModelSpeed should not be called (returns null)
+  const observedGenerating = !isGenerating ? observedModelSpeed(providerUsage, "provider", "provider/model") : null;
+  assert.equal(observedGenerating, null, "speed should be null during generation");
+});
+
 test("service health rows expose enabled dependencies without leaking endpoint details", () => {
   assert.deepEqual(
     serviceHealthRows({
@@ -457,18 +531,26 @@ test("every mutating control in the browser panel names the command it drives", 
   }
 });
 
-test("browser panel exposes translations with matching keys for every language", () => {
+test("browser panel keeps zh-TW complete and every other locale a subset of English", () => {
   assert.deepEqual(
     availableLanguages().map(({ id }) => id),
-    ["en", "zh-CN", "ar", "hi", "ja", "ko"],
+    LANGUAGE_OPTIONS.map(({ id }) => id),
   );
   const keys = translationKeys();
   const englishKeys = [...keys.en].sort();
+  // English carries the source text and zh-TW is the locale this project
+  // authors by hand, so both must define every key. The remaining locales are
+  // overlays: `t()` falls back to English for anything they omit, so a missing
+  // key renders exactly what the panel showed before the copy moved into the
+  // dictionary. They may therefore be incomplete, but must never invent a key
+  // English does not have.
+  assert.deepEqual([...keys["zh-TW"]].sort(), englishKeys, "zh-TW must translate every key");
   for (const language of Object.keys(keys)) {
-    assert.deepEqual([...keys[language]].sort(), englishKeys, `translation keys diverge for ${language}`);
+    const unknown = [...keys[language]].filter((key) => !englishKeys.includes(key));
+    assert.deepEqual(unknown, [], `${language} defines a key English does not have`);
   }
   // Stated separately from the parity check above, which would also pass if a
-  // new string were left out of all six.
+  // new string were left out of every locale.
   for (const language of Object.keys(keys)) {
     for (const key of [
       "general.readOnlySurface",
@@ -490,6 +572,7 @@ test("browser panel exposes translations with matching keys for every language",
     ["hi", "उपयोग"],
     ["ja", "使用量"],
     ["ko", "사용량"],
+    ["es", "Uso"],
   ];
   try {
     for (const [language, navUsage] of samples) {

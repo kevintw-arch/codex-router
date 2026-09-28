@@ -18,6 +18,7 @@ import {
   hasDefaultUserModelReasoning,
   readUserModels,
   userModelEntry,
+  userModelEntryFromCatalog,
   userModelIdentity,
   writeUserModels,
 } from "./user-models.mjs";
@@ -26,6 +27,7 @@ import {
   curationProviderIds,
   curatedModelContextLength,
   curatedModelDescription,
+  curatedModelInputModalities,
   curatedModelProviderId,
   curatedModelReasoningLevels,
   curatedModelRequestProfile,
@@ -60,6 +62,7 @@ const apply = process.argv.includes("--apply");
 const noApply = process.argv.includes("--no-apply");
 const freeOnly = process.argv.includes("--free-only");
 const refreshCatalog = process.argv.includes("--refresh");
+const staticCatalog = process.argv.includes("--static");
 const effortsOption = (() => {
   const index = process.argv.indexOf("--efforts");
   return index === -1 ? undefined : process.argv[index + 1];
@@ -94,12 +97,21 @@ const REQUEST_PROFILE_DESCRIPTIONS = {
     'reject a forced tool_choice ("required") while still calling tools under "auto"',
   "codex-encrypted-schema":
     "reject Codex's encrypted annotation on JSON-Schema nodes while accepting the same tool schema without it",
+  "dashscope-reasoning":
+    "fold Codex's effort onto DashScope's documented ladder for this model's family " +
+    "(Qwen3.8 none/low/medium/xhigh, GLM-5.3 low/high/max, DeepSeek V4.x none/high/max), " +
+    "with `minimal` as the thinking-off rung, and downgrade Qwen3.8's forced tool_choice",
+  "omit-tool-choice":
+    'reject any explicit tool_choice (even "auto") while still calling the listed tools when the field is absent',
 };
 
 if (Object.keys(REQUEST_PROFILE_DESCRIPTIONS).some((profile) => !curatableRequestProfile(profile)) ||
     CURATABLE_REQUEST_PROFILES.some((profile) => !REQUEST_PROFILE_DESCRIPTIONS[profile])) {
   throw new Error("Curatable request-profile descriptions are out of sync.");
 }
+
+// Input modalities a published route may declare; mirrors the registry check.
+const SUPPORTED_INPUT_MODALITIES = ["text", "image"];
 
 // Codex compacts at this fraction of the declared window.
 const AUTO_COMPACT_RATIO = 0.85;
@@ -114,6 +126,13 @@ const AUTO_COMPACT_RATIO = 0.85;
 // prompt tokens errs high on purpose, so against an eight-times-too-small
 // threshold it lands above the compaction limit on turn after turn and the
 // session compacts forever without finishing anything (#266).
+// The picker text for an entry whose sizing or modalities came from the
+// provider's own catalog rather than a documented table or the default.
+export function advertisedModelDescription(providerId, fields) {
+  const named = fields.length === 2 ? `${fields[0]} and ${fields[1]}` : fields[0];
+  return `User-curated ${providerId} model; ${named} as advertised by the provider's catalog at curation time.`;
+}
+
 export function curatedSizing(contextLength) {
   if (!Number.isInteger(contextLength) || contextLength < 1) return undefined;
   return {
@@ -125,7 +144,7 @@ export function curatedSizing(contextLength) {
 function usage() {
   console.error(
     "Usage: curate-models.mjs PROVIDER [--models id1,id2 | interactive] " +
-      "[--free-only] [--remove id1,id2] [--refresh] [--apply|--no-apply] " +
+      "[--free-only] [--remove id1,id2] [--refresh] [--static] [--apply|--no-apply] " +
       `[--efforts ${Object.keys(EFFORT_DESCRIPTIONS).join(",")}] ` +
       `[--request-profile ${Object.keys(REQUEST_PROFILE_DESCRIPTIONS).join("|")}]`,
   );
@@ -323,6 +342,12 @@ if (provider.generic === true && provider.adapter === "openai-completions") {
   );
   process.exit(2);
 }
+if (staticCatalog && providerId !== "vertex") {
+  throw new Error("--static is supported only for Vertex; other providers use their live catalogs.");
+}
+if (staticCatalog && refreshCatalog) {
+  throw new Error("Use --static or --refresh, not both.");
+}
 const flagEfforts = (() => {
   try {
     return effortsOption ? parseEfforts(effortsOption) : undefined;
@@ -354,10 +379,12 @@ function chooseInteractively(candidates, curated) {
   let selected = new Set(
     candidates.map((id, index) => (curated.has(id) ? index + 1 : undefined)).filter(Boolean),
   );
+  const metadataNotice = provider.modelGarden
+    ? "Verified Vertex support metadata will be applied automatically.\n"
+    : "You will be asked for each new model's context window, image support,\n" +
+      "and reasoning efforts; every value stays editable later.\n";
   process.stdout.write(
-    `\nChoose ${provider.displayName} models to add to the picker.\n` +
-      "You will be asked for each new model's context window, image support,\n" +
-      "and reasoning efforts; every value stays editable later.\n",
+    `\nChoose ${provider.displayName} models to add to the picker.\n${metadataNotice}`,
   );
   for (;;) {
     process.stdout.write(`${renderRows(candidates, curated, selected)}\n`);
@@ -414,7 +441,10 @@ async function main() {
   // the caller chose from, and re-asking the provider makes every add pay for
   // a network round trip it does not need. `--refresh` re-asks.
   const discovery = removeOption === undefined
-    ? await discoverProviderModels(providerId, { refresh: refreshCatalog })
+    ? await discoverProviderModels(providerId, {
+        refresh: refreshCatalog,
+        ...(staticCatalog ? { staticCatalog: true } : {}),
+      })
     : { unregistered: [], addable: [], blocked: {} };
   const candidates = [...new Set([...(discovery.addable || discovery.unregistered), ...curated])].sort();
 
@@ -459,10 +489,12 @@ async function main() {
     }
   }
 
-  const inheritedProfile = uniformProviderFamilyRequestProfile(
-    CHECKED_IN_MODELS,
-    familyProviderIds,
-  );
+  // Zen Free mixes unrelated upstream models behind one anonymous catalog.
+  // Its two Muse Responses ids have a documented model-specific profile, so a
+  // checked-in Muse pin must not lend that profile to every other free model.
+  const inheritedProfile = providerId === "opencode-free"
+    ? undefined
+    : uniformProviderFamilyRequestProfile(CHECKED_IN_MODELS, familyProviderIds);
 
   // Which models exist is decided by the provider's own /v1/models endpoint.
   // Metadata comes from that catalog, the interactive user, or the narrow
@@ -475,21 +507,6 @@ async function main() {
       ...(flagEfforts || {}),
       ...(discovery.free?.includes(id) ? { isFree: true } : {}),
     };
-    // The ChatGPT Web launcher owns these catalog rows and derives them from
-    // the signed-in account. Its clean labels and input modalities are part of
-    // the same local contract as the account-gated model ids, so preserve them
-    // instead of turning every row into a generic text-only curated model.
-    if (providerId === "chatgpt-web") {
-      const live = Array.isArray(discovery.modelMetadata)
-        ? discovery.modelMetadata.find((entry) => entry?.upstreamId === id)
-        : discovery.modelMetadata?.[id];
-      if (typeof live?.displayName === "string" && live.displayName) {
-        metadata.displayName = live.displayName;
-      }
-      if (Array.isArray(live?.inputModalities) && live.inputModalities.length) {
-        metadata.inputModalities = live.inputModalities;
-      }
-    }
     // The served catalog value wins when present. OpenCode's exact documented
     // free-model size is the fallback for its id-only Zen catalog; every other
     // silent catalog still gets the conservative generic default.
@@ -505,6 +522,25 @@ async function main() {
     if (!flagEfforts && documentedEfforts) {
       Object.assign(metadata, parseEfforts(documentedEfforts.join(",")) || {});
     }
+    // Zen's /models catalog publishes ids only, so image input has to come
+    // from the same documented free-id table as the window and effort ladder.
+    // Without this, scripted `--models` curation keeps the generic text-only
+    // default even when OpenCode publishes attachment/image for the id.
+    const documentedModalities = curatedModelInputModalities(providerId, id);
+    // What the live catalog says about image input outranks the documented
+    // table the same way its context length does; both beat the text-only
+    // default, which is a guess.
+    // The registry publishes only text and image input (model-registry.mjs
+    // refuses any other value), while resellers advertise file, audio, and
+    // video as well. Keep the served answer for the inputs Codex can carry;
+    // a model that advertises none of them is treated as unsized here.
+    const advertisedModalities = (discovery.inputModalities?.[id] || [])
+      .filter((value) => SUPPORTED_INPUT_MODALITIES.includes(value));
+    if (advertisedModalities.length > 0) {
+      metadata.inputModalities = [...advertisedModalities];
+    } else if (documentedModalities) {
+      metadata.inputModalities = [...documentedModalities];
+    }
     // A documented window or effort ladder is not a conservative default, and
     // this repository records where such a value came from in the entry's own
     // description rather than only in a source comment. The same note names
@@ -514,7 +550,19 @@ async function main() {
     let omitContextNote = Boolean(advertised);
     let omitReasoningNote = Boolean(flagEfforts);
     const describe = () => {
-      if (!documented && !documentedEfforts) return;
+      if (!documented && !documentedEfforts) {
+        // Nothing documented, but the provider's own catalog may have sized
+        // the model or named its input. The generic entry text calls its
+        // metadata a conservative default; that stops being true here.
+        const advertisedFields = [
+          advertised ? "context window" : undefined,
+          advertisedModalities.length > 0 ? "input modalities" : undefined,
+        ].filter(Boolean);
+        if (advertisedFields.length > 0) {
+          metadata.description = advertisedModelDescription(providerId, advertisedFields);
+        }
+        return;
+      }
       const description = curatedModelDescription(providerId, id, {
         omitContextNote,
         omitReasoningNote,
@@ -540,8 +588,13 @@ async function main() {
       // replaced it, so that clause no longer matches what is stored.
       if (context !== documented?.contextWindow) omitContextNote = true;
     }
-    if (confirm(`  Does ${id} accept image input?`)) {
+    const defaultImage = (metadata.inputModalities || []).includes("image");
+    if (confirm(`  Does ${id} accept image input?`, defaultImage)) {
       metadata.inputModalities = ["text", "image"];
+    } else if (documentedModalities) {
+      // Documented modalities were pre-filled above; an explicit no has to
+      // clear them or the stored entry would still advertise image paste.
+      metadata.inputModalities = ["text"];
     }
     if (!flagEfforts) {
       const ladder = metadata.reasoningLevels?.map((level) => level.effort).join(",") || "high";
@@ -592,9 +645,18 @@ async function main() {
     removals: effectiveRemovals,
     interactive: interactiveSelection,
   });
+  const vertexCatalogModels = new Map(
+    (discovery.supportedModels || []).map((model) => [model.id, model]),
+  );
   const nextMine = [
     ...surviving,
     ...additions.map((id, index) => {
+      if (providerId === "vertex") {
+        return userModelEntryFromCatalog({
+          providerId,
+          catalogModel: vertexCatalogModels.get(id),
+        });
+      }
       // Ask for metadata before the profile so interactive prompts stay under
       // one model heading and in the order they are printed.
       const metadata = metadataFor(id);

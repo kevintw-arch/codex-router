@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -25,6 +25,7 @@ const {
   disableProvider,
   enableProvider,
   providerSelectionStatus,
+  pruneUnconfiguredProviders,
   readProviderSelection,
   readProviderSelectionDetail,
   selectedConfiguredListedModels,
@@ -67,7 +68,6 @@ test("provider selection keeps backward compatibility and can hide the final pro
     // credential to configure and they are always available. Everything else
     // has to authenticate before it counts.
     assert.deepEqual(configuredProviderIds(), [
-      "chatgpt-web",
       "custom",
       "kilo-free",
       "lmstudio",
@@ -79,7 +79,6 @@ test("provider selection keeps backward compatibility and can hide the final pro
     delete process.env.KIMI_API_KEY;
     writeProviderCredential("deepseek", "TEST_DEEPSEEK_SELECTION_KEY");
     assert.deepEqual(configuredProviderIds(), [
-      "chatgpt-web",
       "custom",
       "deepseek",
       "kilo-free",
@@ -104,6 +103,7 @@ test("provider selection keeps backward compatibility and can hide the final pro
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4.1-flash",
       ],
     );
     assert.deepEqual(
@@ -112,6 +112,7 @@ test("provider selection keeps backward compatibility and can hide the final pro
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4.1-flash",
       ],
     );
 
@@ -139,6 +140,8 @@ test("opencode Go protocol variants follow their parent as one family", () => {
       "opencode-go-messages",
       "opencode-go-responses",
       "opencode-zen",
+      "opencode-zen-messages",
+      "opencode-zen-responses",
     ]);
 
     const slugs = selectedConfiguredListedModels().map((model) => model.slug);
@@ -223,6 +226,8 @@ test("an authoritative ready pool publishes its family and an unusable pool mask
       "opencode-go-messages",
       "opencode-go-responses",
       "opencode-zen",
+      "opencode-zen-messages",
+      "opencode-zen-responses",
     ]) {
       assert.equal(ready.has(providerId), true, `${providerId} should follow the ready canonical pool`);
     }
@@ -239,6 +244,8 @@ test("an authoritative ready pool publishes its family and an unusable pool mask
       "opencode-go-messages",
       "opencode-go-responses",
       "opencode-zen",
+      "opencode-zen-messages",
+      "opencode-zen-responses",
     ]) {
       assert.equal(unavailable.has(providerId), false, `${providerId} must obey the unusable canonical pool`);
     }
@@ -274,6 +281,7 @@ test("an unknown provider id in the selection file is filtered out, not fatal", 
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4.1-flash",
       ],
     );
     // Doctor and the support bundle read through this, so the damage is
@@ -401,6 +409,82 @@ test("the write path still rejects an unknown provider id", () => {
       ["deepseek", "kimi-api"],
     );
     assert.deepEqual(readProviderSelectionDetail().ignored, []);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("pruneUnconfiguredProviders drops unknown and uncredentialed ids from the file", () => {
+  try {
+    writeProviderCredential("deepseek", "TEST_DEEPSEEK_PRUNE_KEY");
+    stageSelectionFile(
+      `${JSON.stringify({
+        version: 1,
+        providers: ["deepseek", "kimi-api", "provider-from-a-newer-build"],
+      })}\n`,
+    );
+
+    const removed = pruneUnconfiguredProviders();
+    assert.deepEqual(
+      removed.map(({ id, reason }) => [id, reason]).sort(),
+      [
+        ["kimi-api", "no credential"],
+        ["provider-from-a-newer-build", "unrecognised"],
+      ],
+    );
+    assert.deepEqual(
+      JSON.parse(readFileSync(PROVIDER_SELECTION_PATH, "utf8")).providers,
+      ["deepseek"],
+    );
+    assert.deepEqual(pruneUnconfiguredProviders(), []);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("pruneUnconfiguredProviders does not invent a selection file", () => {
+  try {
+    rmSync(testRoot, { recursive: true, force: true });
+    assert.equal(existsSync(PROVIDER_SELECTION_PATH), false);
+    assert.deepEqual(pruneUnconfiguredProviders(), []);
+    assert.equal(existsSync(PROVIDER_SELECTION_PATH), false);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("pruneUnconfiguredProviders deletes a file that names only unknown providers", () => {
+  try {
+    stageSelectionFile(
+      `${JSON.stringify({
+        version: 1,
+        providers: ["provider-from-a-newer-build", "provider-that-was-removed"],
+      })}\n`,
+    );
+
+    const removed = pruneUnconfiguredProviders();
+    assert.deepEqual(
+      removed.map(({ id }) => id).sort(),
+      ["provider-from-a-newer-build", "provider-that-was-removed"],
+    );
+    assert.equal(existsSync(PROVIDER_SELECTION_PATH), false);
+    // Same coherent state as a fresh install: no explicit file means show all,
+    // and the credential-aware catalog still hides anything that cannot auth.
+    assert.deepEqual(readProviderSelection(), [...PROVIDERS.keys()]);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("pruneUnconfiguredProviders keeps anonymous and keyless selections", () => {
+  try {
+    writeProviderSelection(["opencode-free", "local", "kimi-api"]);
+    const removed = pruneUnconfiguredProviders();
+    assert.deepEqual(removed, [{ id: "kimi-api", reason: "no credential" }]);
+    assert.deepEqual(
+      JSON.parse(readFileSync(PROVIDER_SELECTION_PATH, "utf8")).providers,
+      ["opencode-free", "local"],
+    );
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

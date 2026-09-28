@@ -125,12 +125,14 @@ test("buildNamespaceLookupsFromTools handles namespace tools with nested names",
 
   const lookups = buildNamespaceLookupsFromTools(tools);
 
-  assert.equal(lookups.size, 1);
+  // Flat __ join plus dotted inventory alias (#611).
+  assert.equal(lookups.size, 2);
   const execute = lookups.get("mcp__node_repl__execute");
   assert.ok(execute, "Should restore tool from namespace entry");
   // Namespace preserves the full nested name
   assert.equal(execute.namespace, "mcp__node_repl");
   assert.equal(execute.name, "execute");
+  assert.equal(lookups.get("mcp__node_repl.execute"), execute);
 });
 
 test("createResponsesStreamTransform restores namespaced function calls", async () => {
@@ -197,6 +199,75 @@ data: [DONE]
   assert.ok(outputItemData, "Should find output_item.added event data");
   assert.equal(outputItemData.item.namespace, "multi_agent_v1");
   assert.equal(outputItemData.item.name, "spawn_agent");
+});
+
+// The terminal item is what Codex executes, and the completion snapshot is what
+// non-incremental consumers read. Restoring only `output_item.added` left the
+// flattened name on the call Codex actually ran, so namespace tools answered
+// "unsupported call" on every Responses route that relays flattened names.
+test("createResponsesStreamTransform restores the terminal item and the completion snapshot", async () => {
+  const tools = [
+    {
+      type: "function",
+      name: "collaboration__spawn_agent",
+      description: "Spawn a child",
+      parameters: { type: "object", properties: { task_name: { type: "string" } } },
+    },
+  ];
+  const call = {
+    type: "function_call",
+    id: "fc_1",
+    call_id: "call_1",
+    name: "collaboration__spawn_agent",
+    arguments: '{"task_name":"probe"}',
+  };
+  const sseInput = [
+    `event: response.output_item.added\ndata: ${JSON.stringify({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { ...call, arguments: "" },
+    })}\n\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: call,
+    })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "resp_1", output: [call] },
+    })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const transform = createResponsesStreamTransform(buildNamespaceLookupsFromTools(tools));
+  const chunks = [];
+  transform.on("data", (chunk) => chunks.push(chunk.toString("utf8")));
+  await new Promise((resolve, reject) => {
+    transform.on("end", resolve);
+    transform.on("error", reject);
+    transform.write(sseInput);
+    transform.end();
+  });
+
+  const events = chunks
+    .join("")
+    .split(/\n\n/)
+    .map((frame) => frame.split("\n").find((line) => line.startsWith("data: ")))
+    .filter(Boolean)
+    .map((line) => line.slice("data: ".length).trim())
+    .filter((payload) => payload.startsWith("{"))
+    .map((payload) => JSON.parse(payload));
+  const identity = (item) => ({ name: item.name, namespace: item.namespace });
+  const expected = { name: "spawn_agent", namespace: "collaboration" };
+
+  const done = events.find((event) => event.type === "response.output_item.done");
+  assert.deepEqual(identity(done.item), expected, "the executed item is restored");
+  const completed = events.find((event) => event.type === "response.completed");
+  assert.deepEqual(
+    identity(completed.response.output[0]),
+    expected,
+    "the completion snapshot is restored",
+  );
 });
 
 test("createResponsesJsonTransform restores namespaced function calls", async () => {
@@ -399,12 +470,13 @@ test("buildNamespaceLookupsFromTools restores tools from namespace entries", () 
 
   const lookups = buildNamespaceLookupsFromTools(tools);
 
-  // Should restore the tool that came from a namespace entry
-  assert.equal(lookups.size, 1);
+  // Should restore the tool that came from a namespace entry, plus dotted alias
+  assert.equal(lookups.size, 2);
   const restored = lookups.get("mcp__node_repl__execute");
   assert.ok(restored, "Should restore tool from namespace entry");
   assert.equal(restored.namespace, "mcp__node_repl");
   assert.equal(restored.name, "execute");
+  assert.equal(lookups.get("mcp__node_repl.execute"), restored);
 });
 
 test("MCP-style names are left unchanged in responses without namespace tools", async () => {

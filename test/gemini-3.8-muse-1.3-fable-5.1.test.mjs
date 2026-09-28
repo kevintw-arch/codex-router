@@ -11,6 +11,10 @@ process.env.MODEL_ROUTER_USER_MODELS = path.join(testRoot, "user-models.json");
 process.env.MODEL_ROUTER_STATE_DIR = path.join(testRoot, "state");
 
 const { MODEL_BY_SLUG } = await import("../src/model-registry.mjs");
+const { routedModel } = await import("../src/catalog.mjs");
+
+const OPENCODE_FREE_MUSE_SLUG =
+  "opencode-free-responses/muse-spark-1.3-contributor-free";
 
 // Gemini 3.8 Flash routes confirmed 2026-09-03.
 const GEMINI_38_FLASH_ROUTES = [
@@ -21,12 +25,20 @@ const GEMINI_38_FLASH_ROUTES = [
 ];
 
 // Muse Spark 1.3 routes confirmed 2026-09-03.
+const MUSE_12_ROUTES = [
+  ["openrouter/muse-spark-1.2", "meta/muse-spark-1.2", 1_048_576, 943_000],
+  ["openrouter/muse-spark-1.2-contributor", "meta/muse-spark-1.2-contributor", 1_048_576, 943_000],
+];
+
 const MUSE_13_ROUTES = [
+  ["meta/muse-spark-1.3", "muse-spark-1.3", 1_048_576, 900_000],
+  ["meta/muse-spark-1.3-contributor", "muse-spark-1.3-contributor", 1_048_576, 900_000],
   ["openrouter/muse-spark-1.3", "meta/muse-spark-1.3", 1_048_576, 943_000],
   ["openrouter/muse-spark-1.3-contributor", "meta/muse-spark-1.3-contributor", 1_048_576, 943_000],
   ["nousresearch/muse-spark-1.3", "meta/muse-spark-1.3", 1_048_576, 943_000],
   ["nousresearch/muse-spark-1.3-contributor", "meta/muse-spark-1.3-contributor", 1_048_576, 943_000],
   ["opencode-go-responses/muse-spark-1.3-contributor", "muse-spark-1.3-contributor", 1_048_576, 900_000],
+  [OPENCODE_FREE_MUSE_SLUG, "muse-spark-1.3-contributor-free", 1_048_576, 900_000],
 ];
 
 // Claude Fable 5.1 routes confirmed 2026-09-03.
@@ -40,12 +52,26 @@ const FABLE_51_ROUTES = [
 // Additional confirmed routes 2026-09-03.
 const ADDITIONAL_ROUTES = [
   ["commandcode/qwen3.8-max-0902", "Qwen/Qwen3.8-Max-0902", 1_000_000, 900_000],
-  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 900_000],
+  // 400K, not the 900K every other Command Code 1M route carries: the
+  // conservative threshold belongs to GLM-5.3-Flash rather than to a
+  // provider, and this entry shipped with the house default by accident.
+  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 400_000],
   ["opencode-go-messages/qwen3.8-flash", "qwen3.8-flash", 262_144, 235_000],
 ];
 
 test("every Gemini 3.8 Flash route records the upstream id and window", () => {
   for (const [slug, upstreamModel, contextWindow, autoCompact] of GEMINI_38_FLASH_ROUTES) {
+    const model = MODEL_BY_SLUG.get(slug);
+    assert.ok(model, `${slug} is missing from the registry`);
+    assert.equal(model.upstreamModel, upstreamModel);
+    assert.equal(model.listed, true);
+    assert.equal(model.contextWindow, contextWindow);
+    assert.equal(model.autoCompact, autoCompact);
+  }
+});
+
+test("every Muse Spark 1.2 OpenRouter route records the upstream id and window", () => {
+  for (const [slug, upstreamModel, contextWindow, autoCompact] of MUSE_12_ROUTES) {
     const model = MODEL_BY_SLUG.get(slug);
     assert.ok(model, `${slug} is missing from the registry`);
     assert.equal(model.upstreamModel, upstreamModel);
@@ -111,6 +137,50 @@ test("Muse Spark 1.3 routes use auto-tool-choice request profile", () => {
   }
 });
 
+// Command Code documents no effort values for Muse Spark, so 1.3 keeps the
+// single `high` level and no reasoning summaries of its 1.2 route rather than
+// Meta's Responses ladder. Neither version has a Command Code Contributor route.
+test("Command Code Muse Spark 1.3 follows the Command Code 1.2 route", () => {
+  const model = MODEL_BY_SLUG.get("commandcode/muse-spark-1.3");
+  const previous = MODEL_BY_SLUG.get("commandcode/muse-spark-1.2");
+  assert.ok(model, "commandcode/muse-spark-1.3 is missing from the registry");
+  assert.equal(model.upstreamModel, "meta/muse-spark-1.3");
+  assert.equal(model.listed, true);
+  for (const field of ["contextWindow", "autoCompact", "defaultEffort", "requestProfile"]) {
+    assert.equal(model[field], previous[field], field);
+  }
+  assert.deepEqual(model.reasoningLevels, previous.reasoningLevels);
+  assert.deepEqual(model.inputModalities, previous.inputModalities);
+  assert.ok(!model.supportsReasoningSummaries);
+  assert.equal(MODEL_BY_SLUG.has("commandcode/muse-spark-1.3-contributor"), false);
+  assert.equal(MODEL_BY_SLUG.has("commandcode/muse-spark-1.2-contributor"), false);
+});
+
+test("Muse Spark reseller routes advertise text and image input", () => {
+  const visionSlugs = [
+    "meta/muse-spark-1.2",
+    "meta/muse-spark-1.2-contributor",
+    "meta/muse-spark-1.3",
+    "meta/muse-spark-1.3-contributor",
+    "commandcode/muse-spark-1.2",
+    "commandcode/muse-spark-1.3",
+    "openrouter/muse-spark-1.2",
+    "openrouter/muse-spark-1.2-contributor",
+    "openrouter/muse-spark-1.3",
+    "openrouter/muse-spark-1.3-contributor",
+    "nousresearch/muse-spark-1.3",
+    "nousresearch/muse-spark-1.3-contributor",
+    "nousresearch/muse-spark-1.2-contributor",
+    "opencode-go-responses/muse-spark-1.2-contributor",
+    "opencode-go-responses/muse-spark-1.3-contributor",
+    OPENCODE_FREE_MUSE_SLUG,
+  ];
+  for (const slug of visionSlugs) {
+    const model = MODEL_BY_SLUG.get(slug);
+    assert.deepEqual(model.inputModalities, ["text", "image"], slug);
+  }
+});
+
 test("Muse Spark 1.3 reasoning ladders have minimal/low/medium/high/xhigh", () => {
   const expectedEfforts = ["minimal", "low", "medium", "high", "xhigh"];
   for (const [slug] of MUSE_13_ROUTES) {
@@ -120,6 +190,61 @@ test("Muse Spark 1.3 reasoning ladders have minimal/low/medium/high/xhigh", () =
       expectedEfforts,
     );
   }
+});
+
+test("Muse Spark xhigh is labeled as extra deep, not max, and defaults to high", () => {
+  const museSlugs = [
+    ...MUSE_13_ROUTES.map(([slug]) => slug).filter(
+      (slug) => slug !== OPENCODE_FREE_MUSE_SLUG,
+    ),
+    ...MUSE_12_ROUTES.map(([slug]) => slug),
+    "meta/muse-spark-1.2",
+    "meta/muse-spark-1.2-contributor",
+    "meta/muse-spark-1.1",
+  ];
+  for (const slug of museSlugs) {
+    const model = MODEL_BY_SLUG.get(slug);
+    assert.ok(model, `${slug} is missing from the registry`);
+    assert.equal(model.defaultEffort, "high", slug);
+    const xhigh = model.reasoningLevels.find((level) => level.effort === "xhigh");
+    assert.ok(xhigh, `${slug} is missing xhigh`);
+    assert.equal(xhigh.description, "Extra deep reasoning", slug);
+    assert.notEqual(xhigh.description, "Maximum reasoning");
+    assert.ok(
+      !model.reasoningLevels.some((level) => level.effort === "max"),
+      `${slug} must not advertise Meta's unreleased max tier yet`,
+    );
+  }
+});
+
+test("OpenCode Free Muse Spark 1.3 is a native picker entry that defaults to xhigh", () => {
+  const model = MODEL_BY_SLUG.get(OPENCODE_FREE_MUSE_SLUG);
+  assert.ok(model, `${OPENCODE_FREE_MUSE_SLUG} is missing from the registry`);
+  const picker = routedModel(
+    {
+      slug: "gpt-template",
+      display_name: "Template",
+      description: "Template",
+      priority: 10,
+      visibility: "list",
+      apply_patch_tool_type: "freeform",
+    },
+    model,
+  );
+
+  assert.equal(picker.slug, OPENCODE_FREE_MUSE_SLUG);
+  assert.equal(picker.display_name, "Muse Spark 1.3 Contributor (OpenCode Free)");
+  assert.equal(picker.visibility, "list");
+  assert.equal(picker.default_reasoning_level, "xhigh");
+  assert.deepEqual(
+    picker.supported_reasoning_levels.map((level) => level.effort),
+    ["minimal", "low", "medium", "high", "xhigh"],
+  );
+  assert.equal(picker.context_window, 1_048_576);
+  assert.equal(picker.auto_compact_token_limit, 900_000);
+  assert.deepEqual(picker.input_modalities, ["text", "image"]);
+  assert.equal(picker.apply_patch_tool_type, null);
+  assert.equal(picker.multi_agent_version, "v1");
 });
 
 test("Gemini 3.8 Flash reasoning matches provider patterns", () => {
@@ -185,6 +310,7 @@ test("Command Code gemini-3.8-flash has requiresTrailingUserTurn", () => {
 test("no new route sets multiAgentVersion v2 without v2_agent/ artifact", () => {
   const allNewSlugs = [
     ...GEMINI_38_FLASH_ROUTES.map(([slug]) => slug),
+    ...MUSE_12_ROUTES.map(([slug]) => slug),
     ...MUSE_13_ROUTES.map(([slug]) => slug),
     ...FABLE_51_ROUTES.map(([slug]) => slug),
     ...ADDITIONAL_ROUTES.map(([slug]) => slug),
@@ -233,7 +359,7 @@ test("GLM-5.3-Flash input modalities include text and image", () => {
   assert.deepEqual(model.inputModalities, ["text", "image"]);
 });
 
-test("Qwen3.8 Flash opencode-go-messages has auto-tool-choice profile", () => {
+test("Qwen3.8 Flash opencode-go-messages omits tool_choice", () => {
   const model = MODEL_BY_SLUG.get("opencode-go-messages/qwen3.8-flash");
-  assert.equal(model.requestProfile, "auto-tool-choice");
+  assert.equal(model.requestProfile, "omit-tool-choice");
 });

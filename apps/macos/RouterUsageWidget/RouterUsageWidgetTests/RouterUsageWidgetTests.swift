@@ -183,12 +183,58 @@ final class RouterUsageWidgetTests: XCTestCase {
   func testTokenWordingDistinguishesAccountUsageFromRoutedProviderTraffic() {
     let preview = RouterWidgetSnapshot.preview
     XCTAssertEqual(
-      RouterUsageWidgetView.todayTokenLabel(for: preview.usageSource(id: "openai")),
+      RouterUsageWidgetView.todayTokenLabel(
+        for: preview.usageSource(id: "openai"),
+        language: .english
+      ),
       "account tokens"
     )
     XCTAssertEqual(
-      RouterUsageWidgetView.todayTokenLabel(for: preview.usageSource(id: "deepseek")),
+      RouterUsageWidgetView.todayTokenLabel(
+        for: preview.usageSource(id: "deepseek"),
+        language: .english
+      ),
       "tokens routed"
+    )
+  }
+
+  func testLocalizedTokenWordingFollowsThePublishedLanguage() {
+    let preview = RouterWidgetSnapshot.preview
+    XCTAssertEqual(
+      RouterUsageWidgetView.todayTokenLabel(
+        for: preview.usageSource(id: "openai"),
+        language: .chinese
+      ),
+      "账户 token"
+    )
+    XCTAssertEqual(
+      RouterUsageWidgetView.todayTokenLabel(
+        for: preview.usageSource(id: "deepseek"),
+        language: .chinese
+      ),
+      "路由 token"
+    )
+    XCTAssertEqual(RouterResetWidgetView.countdown(to: nil, now: Date(), language: .chinese), "即将")
+    XCTAssertEqual(RouterWidgetLanguage.resolve("chinese"), .chinese)
+    XCTAssertEqual(RouterWidgetLanguage.resolve("english"), .english)
+    XCTAssertEqual(RouterWidgetLanguage.resolve(nil), RouterWidgetLanguage.system)
+  }
+
+  func testRouterOnlyDaysAreNamedInsteadOfPassingAsAccountTotals() {
+    let snapshot = RouterWidgetSnapshot.previewWithRouterOnlyToday
+    let source = snapshot.usageSource(id: "openai")
+
+    XCTAssertTrue(source.todayIsRouterFallback)
+    XCTAssertEqual(
+      RouterUsageWidgetView.todayTokenLabel(for: source, language: .english),
+      "this Mac · account not reported yet"
+    )
+    // The headline number is the measured one, not the zero this used to
+    // publish, and every earlier day keeps its account provenance.
+    XCTAssertEqual(source.todayTokens, 917_968_864)
+    XCTAssertEqual(source.daily.dropLast().filter(\.isRouterFallback).count, 0)
+    XCTAssertFalse(
+      RouterWidgetSnapshot.preview.usageSource(id: "openai").todayIsRouterFallback
     )
   }
 
@@ -242,6 +288,22 @@ final class RouterUsageWidgetTests: XCTestCase {
       family: .systemMedium,
       size: CGSize(width: 364, height: 170),
       entry: RouterUsageEntry(date: now, snapshot: .preview),
+      colorScheme: .light,
+      directory: directory
+    )
+    try render(
+      name: "router-widget-medium-router-only",
+      family: .systemMedium,
+      size: CGSize(width: 364, height: 170),
+      entry: RouterUsageEntry(date: now, snapshot: .previewWithRouterOnlyToday),
+      colorScheme: .light,
+      directory: directory
+    )
+    try render(
+      name: "router-widget-small-router-only",
+      family: .systemSmall,
+      size: CGSize(width: 170, height: 170),
+      entry: RouterUsageEntry(date: now, snapshot: .previewWithRouterOnlyToday),
       colorScheme: .light,
       directory: directory
     )
@@ -344,5 +406,65 @@ final class RouterUsageWidgetTests: XCTestCase {
       return
     }
     try png.write(to: directory.appendingPathComponent("\(name).png"), options: .atomic)
+  }
+}
+
+/// The state the widget is in most of the day: OpenAI has not published a
+/// bucket for today yet, so the newest point is this Mac's own router count.
+private extension RouterWidgetSnapshot {
+  static var previewWithRouterOnlyToday: RouterWidgetSnapshot {
+    let base = RouterWidgetSnapshot.preview
+    var daily = base.daily
+    if let last = daily.last {
+      daily[daily.count - 1] = RouterWidgetDailyPoint(
+        date: last.date,
+        tokens: 917_968_864,
+        isRouterFallback: true
+      )
+    }
+    let todayTokens = daily.last?.tokens ?? 0
+    return RouterWidgetSnapshot(
+      schemaVersion: base.schemaVersion,
+      generatedAt: base.generatedAt,
+      activityState: base.activityState,
+      activeChatCount: base.activeChatCount,
+      selectedProviderID: base.selectedProviderID,
+      selectedProviderName: base.selectedProviderName,
+      todayTokens: todayTokens,
+      daily: daily,
+      quotas: base.quotas,
+      usageSources: base.usageSources?.map { source in
+        source.id == RouterWidgetSnapshot.defaultUsageSourceID
+          ? RouterWidgetUsageSource(
+              id: source.id,
+              name: source.name,
+              todayTokens: todayTokens,
+              daily: daily
+            )
+          : source
+      }
+    )
+  }
+}
+
+final class TraditionalChineseWidgetTests: XCTestCase {
+  func testIdentifiersPreserveOldSnapshots() {
+    for tag in ["traditionalChinese", "zh-TW", "zh-Hant", "zh-HK", "zh_MO", "zh-Hant-CN", "zh-Hant-x-hans"] {
+      XCTAssertEqual(RouterWidgetLanguage.resolve(tag), .traditionalChinese)
+    }
+    for tag in ["chinese", "zh-CN", "zh-Hans-TW", "zh", "zh-x-hant", "zh-x-TW", "zh-u-rg-twzzzz"] {
+      XCTAssertEqual(RouterWidgetLanguage.resolve(tag), .chinese)
+    }
+    XCTAssertEqual(RouterWidgetLanguage.resolve("japanese"), .english)
+    XCTAssertEqual(RouterWidgetLanguage.resolve("zh-Latn-TW"), .english)
+    XCTAssertEqual(RouterWidgetLanguage.resolve("zh---CN"), .english)
+    XCTAssertEqual(RouterWidgetLanguage.publishedIdentifier(for: .traditionalChinese), "traditionalChinese")
+  }
+
+  func testCompleteCatalogsAndValues() {
+    XCTAssertEqual(Set(RouterWidgetChineseText.values.keys), Set(RouterWidgetTraditionalChineseText.values.keys))
+    XCTAssertEqual(RouterWidgetLanguage.traditionalChinese.text("Waiting for router data"), "正在等待路由資料")
+    XCTAssertEqual(RouterWidgetLanguage.traditionalChinese.format("%d percent left", 42), "剩餘 42%")
+    XCTAssertEqual(RouterWidgetLanguage.traditionalChinese.text("vendor/unknown-id"), "vendor/unknown-id")
   }
 }

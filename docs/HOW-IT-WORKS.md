@@ -59,7 +59,12 @@ catalog, router, gateway generator, API forwarder, and doctor.
 It controls routed picker visibility and dispatcher access. `model-picker.json`
 stores the durable per-model decision, including explicit show choices, and the
 Codex, DeepSeek Harness, Gemini, and Cursor publishers all consume that same state for
-external models. In a signed-in Codex install, the native GPT catalog and its
+external models. The same file carries the Codex picker `order`: `native-first`
+(the default, routed models publish after the highest visible native GPT
+priority) or `routed-first` (every routed model publishes ahead of the natives,
+in vendor-group order, and the natives shift after them). Set it with
+`./bin/model-router codex picker-order routed-first|native-first|status`; the
+command republishes the catalog, and Codex reloads the picker on its next start. In a signed-in Codex install, the native GPT catalog and its
 base-entry visibility remain Codex-owned, so a router "hide all" action cannot
 erase the original native picker. A known namespaced model whose provider is hidden receives a local
 `provider_not_enabled` error; it is never mistaken for a native model or
@@ -121,6 +126,22 @@ do not claim to be based on GPT-5.
 The integration deliberately keeps the built-in `openai` provider and points
 it at a loopback `openai_base_url`. This makes named models appear in the normal
 picker instead of replacing the provider with a generic `Custom` entry.
+
+Current Codex builds validate a prefixed external model against the selected
+provider before sending the request. When the user explicitly enables signed
+routing from a root-OpenAI configuration, the router therefore snapshots the
+root provider and selects its dedicated `codex-router-signed` provider. That
+provider still requires ChatGPT authentication and sends both native and
+external Responses requests to the local router. The switch uses the signed
+state format already understood by the previous release, so downgrading can
+still disable it and restore the prior provider. Ordinary install, update,
+repair, and catalog refresh maintain an existing signed mode but never convert
+one implicitly; changing modes requires an explicit off/on toggle.
+
+Native redirect is a separate, all-or-nothing control. If configured, it still
+redirects unmatched native GPT turns while signed routing is enabled, and
+turning model failover off does not disable it. Clear native redirect separately
+when selected native GPT models should remain on OpenAI.
 
 For a selected custom provider, the tray's login-free switch keeps the provider
 id unchanged and temporarily replaces its complete table with a router-owned,
@@ -243,6 +264,14 @@ operator can opt in locally only by adding `searchTool` to that exact entry in
 the protected `user-models.json` after verifying the route. The curation CLI
 does not ask for or infer search mode from an upstream catalog claim.
 
+Accepting a completed `web_search_call` in conversation history is a narrower
+input-compatibility capability than executing a new search. A route that has
+been live-tested for history replay may declare `supportsSearchHistory: true`
+without a `searchTool`; this keeps new search unavailable while allowing that
+route to continue or compact an existing searched conversation. The flag is
+false by default and, like `searchTool`, belongs to the exact model/provider
+route rather than to an OpenAI-compatible protocol family.
+
 ### Per-model search sidecar
 
 A model without `searchTool` can be opted into the Perplexity Search sidecar.
@@ -355,8 +384,27 @@ external model. Ordinary routed prompts do not use this relay.
 The relay requires an active ChatGPT sign-in because only the native Codex
 backend can open its own opaque payload. In login-free mode the router fails
 closed instead of forwarding unreadable ciphertext to an external provider.
+A native relay `429` stays a `429` instead of becoming a gateway-style `502`,
+and the router remembers that exact account-and-ciphertext refusal for 60
+seconds so client retries do not repeatedly hit native quota. A native relay
+`401` likewise stays `401`, with the upstream body removed, so Codex's own
+ChatGPT authentication recovery can refresh the session and retry. The short
+429 backoff stores only the already-hashed cache key and an expiry timestamp;
+other accounts and delegated payloads remain independent. Operators can tune
+the window with `CODEX_ROUTER_AGENT_RELAY_FAILURE_BACKOFF_MS`.
 
-Only registry-proven models are advertised as native v2 spawn-agent overrides.
+At service startup, the post-health reconciliation checks both native model
+metadata and the router-managed Codex agent definitions. If the native catalog
+is current but a routed `router-model-*.toml` definition is missing, stale,
+unprotected, or left over for a model that is no longer eligible, the installed
+picker is republished to restore the coupled catalog/agent state. An unreadable
+or foreign Codex transport is never repaired speculatively.
+
+Only registry-proven models are advertised as native v2 spawn-agent overrides,
+and an explicit spawn model is kept: a child runs on the model the operator
+picked from Codex's own list instead of being pinned back to the routed parent.
+Codex checks that value against its list before the call is dispatched, so an
+override cannot name a route the operator was never offered.
 The Settings tab (desktop panel and macOS tray) exposes two local accordions:
 **Subagent models** can withhold or re-enable proven models, while **Model
 picker** controls visibility. Local settings never promote an unverified model

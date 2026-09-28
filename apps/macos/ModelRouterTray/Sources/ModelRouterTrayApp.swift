@@ -267,7 +267,9 @@ struct ProviderCatalogReloadBatch: Equatable {
     case .loaded:
       loaded += 1
     case .superseded:
-      failures.append("\(sourceID): reload superseded by a credential change")
+      failures.append(
+        routerFormat("%@: reload superseded by a credential change", sourceID)
+      )
     case .failed(let detail):
       failures.append(detail)
     }
@@ -275,12 +277,19 @@ struct ProviderCatalogReloadBatch: Equatable {
 
   var message: String {
     if failures.isEmpty {
-      return "Reloaded current models from \(loaded) catalog\(loaded == 1 ? "" : "s")."
+      return loaded == 1
+        ? routerLocalized("Reloaded current models from 1 catalog.")
+        : routerFormat("Reloaded current models from %d catalogs.", loaded)
     }
     if loaded == 0 {
-      return "Catalog reload failed: \(failures.joined(separator: " · "))"
+      return routerFormat("Catalog reload failed: %@", failures.joined(separator: " · "))
     }
-    return "Reloaded \(loaded) catalog\(loaded == 1 ? "" : "s"); \(failures.count) failed: \(failures.joined(separator: " · "))"
+    return routerFormat(
+      "%d reloaded; %d failed: %@",
+      loaded,
+      failures.count,
+      failures.joined(separator: " · ")
+    )
   }
 }
 
@@ -458,7 +467,10 @@ final class TrayMenuController: NSObject {
 
   init(store: RouterStore) {
     self.store = store
-    let length = MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode)
+    let length = MenuBarLayoutMetrics.statusItemWidth(
+      displayMode: store.menuBarDisplayMode,
+      standardContentWidth: store.menuBarStandardWidth()
+    )
     statusItem = NSStatusBar.system.statusItem(withLength: length)
     let hosting = NSHostingView(rootView: StatusItemLabel(store: store))
     hosting.sizingOptions = []
@@ -476,11 +488,19 @@ final class TrayMenuController: NSObject {
     super.init()
     configureStatusItem()
     configurePanel()
-    displayModeCancellable = store.$menuBarDisplayMode
+    // Standard mode is measured from the label, so the slot has to follow the
+    // provider name, the usage text and the icon style -- not just the display
+    // mode. objectWillChange fires before the store mutates, and hopping to the
+    // main queue lands after it, so the measurement reads the new values.
+    // applyStatusItemMetrics() is a no-op when the width is unchanged.
+    displayModeCancellable = store.objectWillChange
       .receive(on: DispatchQueue.main)
       .sink { [weak self] _ in
         guard let self else { return }
-        self.applyStatusItemMetrics()
+        // Only a slot that actually resized can have moved the panel's anchor.
+        // Repositioning on every store tick would drag AppKit through a window
+        // frame change once a second while the panel is open.
+        guard self.applyStatusItemMetrics() else { return }
         if self.panel.isVisible {
           self.reposition()
         }
@@ -555,11 +575,24 @@ final class TrayMenuController: NSObject {
     panel.setContentSize(TrayPanelPlacement.panelSize)
   }
 
-  private func applyStatusItemMetrics() {
-    let width = MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode)
+  /// Returns whether the slot actually changed size.
+  @discardableResult
+  private func applyStatusItemMetrics() -> Bool {
+    let width = MenuBarLayoutMetrics.statusItemWidth(
+      displayMode: store.menuBarDisplayMode,
+      standardContentWidth: store.menuBarStandardWidth()
+    )
     let height = MenuBarLayoutMetrics.statusItemHeight(displayMode: store.menuBarDisplayMode)
+    // Standard mode is now content-sized, so this runs on every label change,
+    // not just a mode switch. Assigning an unchanged length still makes AppKit
+    // relayout the menu bar, and the activity poll ticks once a second.
+    guard statusItem.length != width
+      || statusHostingView.frame.width != width
+      || statusHostingView.frame.height != height
+    else { return false }
     statusItem.length = width
     statusHostingView.frame = NSRect(x: 0, y: 0, width: width, height: height)
+    return true
   }
 
   @objc private func statusItemClicked(_ sender: Any?) {
@@ -821,7 +854,7 @@ enum ControlCenterLauncher {
   static func open(navigation: ControlCenterNavigationRequest? = nil) {
     guard let application = bundledApplicationURL else {
       RouterStore.shared.reportControlCenterLaunchFailure(
-        "The embedded Control Center is missing. Rebuild Codex Router."
+        routerLocalized("The embedded Control Center is missing. Rebuild Codex Router.")
       )
       return
     }
@@ -856,7 +889,9 @@ enum ControlCenterLauncher {
       try await Task.sleep(for: .milliseconds(100))
     }
     throw RouterError(
-      "A superseded Codex Router Control Center is still running. Quit it, then reopen Codex Router."
+      routerLocalized(
+        "A superseded Codex Router Control Center is still running. Quit it, then reopen Codex Router."
+      )
     )
   }
 
@@ -872,7 +907,7 @@ enum ControlCenterLauncher {
       let message = error.localizedDescription
       Task { @MainActor in
         RouterStore.shared.reportControlCenterLaunchFailure(
-          "Control Center could not open: \(message)"
+          routerFormat("Control Center could not open: %@", message)
         )
       }
     }
@@ -1049,47 +1084,6 @@ final class RouterStore: ObservableObject {
   private var latestObservedActivityRequestID: String?
   private var lastObservedSessionID: String?
   private var activityHealthFailureStartedAt: Date?
-  private var dailyUsageCache: [DailyUsageCacheKey: [DailyUsagePoint]] = [:]
-  private var localUsageTotalsCache: [LocalUsageTotalsCacheKey: UsageTotals] = [:]
-
-  private struct DailyUsageCacheBucket: Hashable {
-    let startDate: String
-    let tokens: Int64
-    let isRouterFallback: Bool
-  }
-
-  private struct DailyUsageCacheKey: Hashable {
-    let providerID: String
-    let days: Int
-    let today: Date
-    let buckets: [DailyUsageCacheBucket]
-  }
-
-  private struct LocalUsageTotalsCacheBucket: Hashable {
-    let startDate: String
-    let tokens: Int64
-    let requests: Int
-  }
-
-  private struct LocalUsageTotalsCacheKey: Hashable {
-    let providerID: String
-    let days: Int
-    let today: Date
-    let buckets: [LocalUsageTotalsCacheBucket]
-  }
-
-  private struct UsageTotals {
-    let tokens: Double
-    let requests: Int
-  }
-
-  private static let dayKeyFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.calendar = Calendar(identifier: .gregorian)
-    formatter.dateFormat = "yyyy-MM-dd"
-    return formatter
-  }()
 
   // What the three stored signals mean, as one pure decision. Pulled out of
   // `init` so it can be tested: the mode this picks is the difference between
@@ -1587,7 +1581,7 @@ final class RouterStore: ObservableObject {
       // the next Codex launch retry from a known-unknown intent.
       serviceIntent = .unknown
       if action == "stop" { pendingServiceStop = nil }
-      message = "Router \(action): \(error.localizedDescription)"
+      message = routerFormat("Router %@: %@", action, error.localizedDescription)
     }
     await refresh()
   }
@@ -1651,7 +1645,7 @@ final class RouterStore: ObservableObject {
     var choices = [
       UsageProviderChoice(
         id: "openai", displayName: "ChatGPT", shortName: "ChatGPT",
-        detail: "Codex subscription", isEnabled: true),
+        detail: routerLocalized("Codex subscription"), isEnabled: true),
     ]
     for provider in registryProviders {
       choices.append(UsageProviderChoice(
@@ -1671,9 +1665,7 @@ final class RouterStore: ObservableObject {
   var selectedUsageText: String? {
     if selectedUsageUsesChatGPT {
       guard let primary = accountUsage?.primary else { return nil }
-      return RouterLanguage.isSimplifiedChinese
-        ? "剩余 \(primary.remainingPercent)%"
-        : "\(primary.remainingPercent)% left"
+      return routerMessage(.remainingPercent, ["count": "\(primary.remainingPercent)"])
     }
     guard providerUsage != nil else { return nil }
     if let metric = selectedAccountMetric { return formattedAccountMetric(metric) }
@@ -1718,9 +1710,7 @@ final class RouterStore: ObservableObject {
 
   var activitySummaryLabel: String {
     if activityState == .generating, activeChatCount > 1 {
-      return RouterLanguage.isSimplifiedChinese
-        ? "\(activeChatCount) 个会话"
-        : "\(activeChatCount) chats"
+      return routerMessage(.activeChats, ["count": "\(activeChatCount)"])
     }
     return activityState.label
   }
@@ -1731,6 +1721,26 @@ final class RouterStore: ObservableObject {
     if names.count == 1 { return names[0] }
     if names.count == 2 { return "\(names[0]) + \(names[1])" }
     return "\(names[0]) +\(names.count - 1)"
+  }
+
+  // The exact strings StatusItemLabel draws. The status item is sized from
+  // these, so the measurement and the render cannot drift apart.
+  var menuBarNameText: String {
+    hasConcurrentActivity ? activitySummaryLabel : selectedUsageProvider.shortName
+  }
+
+  var menuBarDetailText: String {
+    hasConcurrentActivity ? compactActivityProvidersLabel : (selectedUsageText ?? "")
+  }
+
+  func menuBarStandardWidth(pulsing: Bool = false) -> CGFloat {
+    MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: menuBarIconStyle,
+      showModelName: menuBarShowModelName,
+      nameText: menuBarNameText,
+      detailText: menuBarDetailText,
+      pulsing: pulsing
+    )
   }
 
   var uniqueActiveProviderShortNames: [String] {
@@ -1945,6 +1955,19 @@ final class RouterStore: ObservableObject {
         return
       }
     }
+  }
+
+  // Reopening the panel does not need a new snapshot. `bin/control --json`
+  // spawns a Node process per target and costs seconds of CPU, while the
+  // registry it reports changes far more slowly than the tray is opened; the
+  // background poll and every mutation still refresh unconditionally. Activity
+  // and health are not covered by this: they have their own native probe.
+  // nonisolated so the default argument below can read it off the main actor.
+  nonisolated static let openSnapshotMaxAge: TimeInterval = 60
+
+  func refreshIfStale(maxAge: TimeInterval = RouterStore.openSnapshotMaxAge) async {
+    if let lastUpdated, Date().timeIntervalSince(lastUpdated) < maxAge { return }
+    await refresh()
   }
 
   func refresh() async {
@@ -2195,7 +2218,12 @@ final class RouterStore: ObservableObject {
       providerCatalogs[providerID] = catalog
       let origin = catalog.cached == true ? "saved" : "current"
       if reportsOutcome {
-        message = "\(catalog.discovered.count) \(origin) \(providerID) models loaded. Select the ones to add below."
+        message = routerFormat(
+          "%d %@ models loaded from %@. Select the ones to add below.",
+          catalog.discovered.count,
+          routerLocalized(origin),
+          providerID
+        )
       }
       return .loaded
     } catch {
@@ -2246,7 +2274,11 @@ final class RouterStore: ObservableObject {
        let blockedID = unique.first(where: { !catalog.addableModelIDs.contains($0) })
     {
       message = catalog.blocked?[blockedID]
-        ?? "\(blockedID) is not an addable \(providerID) catalog candidate."
+        ?? routerFormat(
+          "%@ is not an addable %@ catalog candidate.",
+          blockedID,
+          providerID
+        )
       return
     }
     guard !providerCatalogLoading.contains(providerID) else { return }
@@ -2265,7 +2297,16 @@ final class RouterStore: ObservableObject {
       // Curation just re-asked upstream and rewrote the stored list, so the
       // cache-first read here is the fresh answer without a second round trip.
       await reloadProviderCatalog(providerID)
-      message = "\(unique.count) \(providerID) model\(unique.count == 1 ? "" : "s") added. Restart Codex to refresh its picker."
+      message = unique.count == 1
+        ? routerFormat(
+          "1 %@ model added. Restart Codex to refresh its model picker.",
+          providerID
+        )
+        : routerFormat(
+          "%d %@ models added. Restart Codex to refresh its model picker.",
+          unique.count,
+          providerID
+        )
     } catch {
       providerCatalogLoading.remove(providerID)
       message = "\(providerID): \(error.localizedDescription)"
@@ -2285,7 +2326,9 @@ final class RouterStore: ObservableObject {
     if setupAction == "probe" {
       await performProviderOperation(
         provider,
-        successMessage: "Live compatibility verified and provider enabled. Restart Codex to refresh its model picker."
+        successMessage: routerLocalized(
+          "Live compatibility verified and provider enabled. Restart Codex to refresh its model picker."
+        )
       ) {
         _ = try await runControl(arguments: ["probe-provider", provider, "--live", "--yes"])
         try await updateProviderSelection(provider, enabled: true)
@@ -2299,13 +2342,17 @@ final class RouterStore: ObservableObject {
     await performProviderOperation(
       provider,
       progressMessage: reconnecting
-        ? "Opening \(displayName) sign-in in your browser…"
-        : "Starting \(displayName) sign-in…",
+        ? routerFormat("Opening %@ sign-in in your browser…", displayName)
+        : routerFormat("Starting %@ sign-in…", displayName),
       successMessage: awaitsAntigravityProbe
-        ? "Signed in. Run the live compatibility test before enabling this provider."
+        ? routerLocalized(
+          "Signed in. Run the live compatibility test before enabling this provider."
+        )
         : reconnecting
-          ? "Provider reconnected."
-          : "Provider connected. Restart Codex to refresh its model picker."
+          ? routerLocalized("Provider reconnected.")
+          : routerLocalized(
+            "Provider connected. Restart Codex to refresh its model picker."
+          )
     ) {
       if needsInstall {
         _ = try await runControl(arguments: ["install-cli", provider])
@@ -2326,13 +2373,17 @@ final class RouterStore: ObservableObject {
     await performProviderOperation(
       provider,
       progressMessage: reconnecting
-        ? "Opening \(displayName) sign-in in your browser…"
-        : "Starting \(displayName) sign-in…",
+        ? routerFormat("Opening %@ sign-in in your browser…", displayName)
+        : routerFormat("Starting %@ sign-in…", displayName),
       successMessage: provider == "antigravity-oauth"
-        ? "Signed in again. Run the live compatibility test before re-enabling this provider."
+        ? routerLocalized(
+          "Signed in again. Run the live compatibility test before re-enabling this provider."
+        )
         : reconnecting
-          ? "Provider reconnected."
-          : "Provider connected. Restart Codex to refresh its model picker."
+          ? routerLocalized("Provider reconnected.")
+          : routerLocalized(
+            "Provider connected. Restart Codex to refresh its model picker."
+          )
     ) {
       _ = try await runControl(arguments: ["login", provider])
       if !reconnecting {
@@ -2343,10 +2394,13 @@ final class RouterStore: ObservableObject {
 
   func saveProviderKey(_ provider: String, key: String) async {
     let secret = Data(key.utf8)
-    let label = providerSetup[provider]?.credentialLabel ?? "API key"
+    let label = routerLocalized(providerSetup[provider]?.credentialLabel ?? "API key")
     await performProviderOperation(
       provider,
-      successMessage: "\(label) saved. Restart Codex to refresh its model picker."
+      successMessage: routerFormat(
+        "%@ saved. Restart Codex to refresh its model picker.",
+        label
+      )
     ) {
       _ = try await runControl(arguments: ["credential", provider], stdin: secret)
     }
@@ -2355,10 +2409,13 @@ final class RouterStore: ObservableObject {
   // The credential command removes the key, disables the provider, and publishes
   // the resulting selection under one model-overlay lock.
   func removeProviderKey(_ provider: String) async {
-    let label = providerSetup[provider]?.credentialLabel ?? "API key"
+    let label = routerLocalized(providerSetup[provider]?.credentialLabel ?? "API key")
     await performProviderOperation(
       provider,
-      successMessage: "\(label) removed. Restart Codex to refresh its model picker."
+      successMessage: routerFormat(
+        "%@ removed. Restart Codex to refresh its model picker.",
+        label
+      )
     ) {
       _ = try await runControl(arguments: ["credential", provider, "--remove"])
     }
@@ -2378,7 +2435,10 @@ final class RouterStore: ObservableObject {
   }
 
   func dailyUsage(for providerID: String, days: Int) -> [DailyUsagePoint] {
-    let buckets: [DailyUsageCacheBucket]
+    // Pure read: never mutate store state from a SwiftUI body call site.
+    // Issue #601 pegged a core when the old memo keyed on growing bucket
+    // arrays and wrote that cache during layout of the usage LazyVGrid.
+    let buckets: [DailyUsageDisplayBucket]
     if providerID == "openai" {
       // OpenAI's account stream is authoritative whenever it contains a date.
       // The local OpenAI provider stream is narrower router telemetry, so it
@@ -2386,41 +2446,23 @@ final class RouterStore: ObservableObject {
       buckets = mergeAccountUsageBuckets(
         account: accountUsage?.dailyUsageBuckets ?? [],
         router: providerUsage(for: "openai")?.dailyUsageBuckets ?? []
-      ).map {
-        DailyUsageCacheBucket(
-          startDate: $0.startDate,
-          tokens: $0.tokens,
-          isRouterFallback: $0.isRouterFallback
-        )
-      }
+      )
     } else {
       buckets = providerUsage(for: providerID)?.dailyUsageBuckets.map {
-        DailyUsageCacheBucket(startDate: $0.startDate, tokens: $0.tokens, isRouterFallback: false)
+        DailyUsageDisplayBucket(
+          startDate: $0.startDate,
+          tokens: $0.tokens,
+          isRouterFallback: false
+        )
       } ?? []
     }
-    let calendar = Calendar.current
-    let today = calendar.startOfDay(for: .now)
-    let cacheKey = DailyUsageCacheKey(
-      providerID: providerID,
+    let calendar = usageDayCalendar
+    return dailyUsagePoints(
+      from: buckets,
       days: days,
-      today: today,
-      buckets: buckets
+      today: calendar.startOfDay(for: .now),
+      calendar: calendar
     )
-    if let cached = dailyUsageCache[cacheKey] { return cached }
-
-    let indexed = Dictionary(uniqueKeysWithValues: buckets.map { ($0.startDate, $0) })
-    let points = (0..<days).map { offset in
-      let date = calendar.date(byAdding: .day, value: offset - (days - 1), to: today) ?? today
-      let bucket = indexed[Self.dayKeyFormatter.string(from: date)]
-      return DailyUsagePoint(
-        date: date,
-        tokens: Double(bucket?.tokens ?? 0),
-        isRouterFallback: bucket?.isRouterFallback ?? false
-      )
-    }
-    if dailyUsageCache.count >= 24 { dailyUsageCache.removeAll(keepingCapacity: true) }
-    dailyUsageCache[cacheKey] = points
-    return points
   }
 
   func localUsageTotals(days: Int) -> (tokens: Double, requests: Int) {
@@ -2429,39 +2471,13 @@ final class RouterStore: ObservableObject {
 
   func localUsageTotals(for providerID: String, days: Int) -> (tokens: Double, requests: Int) {
     guard providerID != "openai", let usage = providerUsage(for: providerID) else { return (0, 0) }
-    let calendar = Calendar.current
-    let today = calendar.startOfDay(for: .now)
-    let buckets = usage.dailyUsageBuckets.map {
-      LocalUsageTotalsCacheBucket(
-        startDate: $0.startDate,
-        tokens: $0.tokens,
-        requests: $0.requests
-      )
-    }
-    let cacheKey = LocalUsageTotalsCacheKey(
-      providerID: providerID,
+    let calendar = usageDayCalendar
+    return sumLocalUsageTotals(
+      from: usage.dailyUsageBuckets,
       days: days,
-      today: today,
-      buckets: buckets
+      today: calendar.startOfDay(for: .now),
+      calendar: calendar
     )
-    if let cached = localUsageTotalsCache[cacheKey] {
-      return (cached.tokens, cached.requests)
-    }
-
-    let firstDay = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
-    let totals = usage.dailyUsageBuckets.reduce(into: (tokens: 0.0, requests: 0)) { totals, bucket in
-      guard let date = Self.dayKeyFormatter.date(from: bucket.startDate),
-            date >= firstDay,
-            date <= today
-      else { return }
-      totals.tokens += Double(bucket.tokens)
-      totals.requests += bucket.requests
-    }
-    if localUsageTotalsCache.count >= 48 {
-      localUsageTotalsCache.removeAll(keepingCapacity: true)
-    }
-    localUsageTotalsCache[cacheKey] = UsageTotals(tokens: totals.tokens, requests: totals.requests)
-    return totals
   }
 
   func localUsageSummary(for providerID: String, days: Int = 7) -> String {
@@ -2470,7 +2486,7 @@ final class RouterStore: ObservableObject {
       return "\(compactTokenCount(totals.tokens)) tok"
     }
     if totals.requests > 0 {
-      return RouterLanguage.isSimplifiedChinese ? "\(totals.requests) 个请求" : "\(totals.requests) req"
+      return routerMessage(.requestsShort, ["count": "\(totals.requests)"])
     }
     return routerLocalized("No traffic")
   }
@@ -2590,8 +2606,8 @@ final class RouterStore: ObservableObject {
       success: { [weak self] enabled in
         await self?.refreshProviderUsage()
         return enabled
-          ? "Provider added. Restart Codex to refresh its model picker."
-          : "Provider hidden. Restart Codex to refresh its model picker."
+          ? routerLocalized("Provider added. Restart Codex to refresh its model picker.")
+          : routerLocalized("Provider hidden. Restart Codex to refresh its model picker.")
       }
     )
   }
@@ -2614,7 +2630,7 @@ final class RouterStore: ObservableObject {
       finishNativeMutation()
     }
     providerOperation = "maintenance"
-    maintenanceMessage = "Running update and doctor…"
+    maintenanceMessage = routerLocalized("Running update and doctor…")
     maintenanceSucceeded = false
     defer { providerOperation = nil }
     do {
@@ -2626,7 +2642,9 @@ final class RouterStore: ObservableObject {
       await refreshProviderUsage()
       await refreshProviderSetup()
       maintenanceSucceeded = true
-      maintenanceMessage = "Update installed. Fully quit and reopen Codex to load updated models and agents."
+      maintenanceMessage = routerLocalized(
+        "Update installed. Fully quit and reopen Codex to load updated models and agents."
+      )
     } catch {
       maintenanceMessage = error.localizedDescription
       await refresh()
@@ -2755,7 +2773,7 @@ final class RouterStore: ObservableObject {
       finishNativeMutation()
     }
     providerOperation = "doctor"
-    maintenanceMessage = "Running doctor --fix…"
+    maintenanceMessage = routerLocalized("Running doctor --fix…")
     maintenanceSucceeded = false
     defer { providerOperation = nil }
     do {
@@ -2767,7 +2785,9 @@ final class RouterStore: ObservableObject {
       await refreshProviderUsage()
       await refreshProviderSetup()
       maintenanceSucceeded = true
-      maintenanceMessage = "Repair verified. Fully quit and reopen Codex if models changed."
+      maintenanceMessage = routerLocalized(
+        "Repair verified. Fully quit and reopen Codex if models changed."
+      )
     } catch {
       maintenanceMessage = error.localizedDescription
       await refresh()
@@ -2784,14 +2804,17 @@ final class RouterStore: ObservableObject {
         _ = try await self.runControl(arguments: ["auth-mode", enabled ? "on" : "off"])
       },
       success: { [weak self] enabled in
-        guard let self else { return "Mode changed." }
+        guard let self else { return routerLocalized("Mode changed.") }
         do {
           try await self.restartCodexApp()
           return enabled
-            ? "Codex restarted with external-provider mode."
-            : "Codex restarted with OpenAI login restored."
+            ? routerLocalized("Codex restarted with external-provider mode.")
+            : routerLocalized("Codex restarted with OpenAI login restored.")
         } catch {
-          return "Mode changed, but Codex could not restart: \(error.localizedDescription)"
+          return routerFormat(
+            "Mode changed, but Codex could not restart: %@",
+            error.localizedDescription
+          )
         }
       }
     )
@@ -2808,8 +2831,8 @@ final class RouterStore: ObservableObject {
       },
       success: { enabled in
         enabled
-        ? "Router with ChatGPT enabled. Fully quit and reopen Codex when ready."
-        : "Previous provider restored. Fully quit and reopen Codex when ready."
+        ? routerLocalized("Router with ChatGPT enabled. Fully quit and reopen Codex when ready.")
+        : routerLocalized("Previous provider restored. Fully quit and reopen Codex when ready.")
       }
     )
   }
@@ -2848,7 +2871,7 @@ final class RouterStore: ObservableObject {
         guard let self else { return }
         _ = try await self.runControl(arguments: ["subagents", "mode", mode])
       },
-      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+      success: { _ in routerLocalized("Model settings applied. Restart Codex to refresh its picker.") }
     )
   }
 
@@ -2863,7 +2886,7 @@ final class RouterStore: ObservableObject {
           arguments: ["subagents", "set", slug, enabled ? "on" : "off"]
         )
       },
-      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+      success: { _ in routerLocalized("Model settings applied. Restart Codex to refresh its picker.") }
     )
   }
 
@@ -2892,7 +2915,7 @@ final class RouterStore: ObservableObject {
           arguments: ["picker", "set", slug, visible ? "show" : "hide"]
         )
       },
-      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+      success: { _ in routerLocalized("Model settings applied. Restart Codex to refresh its picker.") }
     )
   }
 
@@ -2927,7 +2950,7 @@ final class RouterStore: ObservableObject {
         guard let self else { return }
         _ = try await self.runControl(arguments: ["vision-bridge", enabled ? "on" : "off"])
       },
-      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+      success: { _ in routerLocalized("Model settings applied. Restart Codex to refresh its picker.") }
     )
   }
 
@@ -2944,8 +2967,10 @@ final class RouterStore: ObservableObject {
       },
       success: { enabled in
         enabled
-        ? "Token maxxing is on for the next external-model request."
-        : "Token maxxing is off; exact tool results will be sent on the next external-model request."
+        ? routerLocalized("Token maxxing is on for the next external-model request.")
+        : routerLocalized(
+          "Token maxxing is off; exact tool results will be sent on the next external-model request."
+        )
       }
     )
   }
@@ -2975,7 +3000,7 @@ final class RouterStore: ObservableObject {
           arguments: ["local-models", "set", tag, enabled ? "on" : "off"]
         )
       },
-      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+      success: { _ in routerLocalized("Model settings applied. Restart Codex to refresh its picker.") }
     )
   }
 
@@ -3037,7 +3062,7 @@ final class RouterStore: ObservableObject {
     do {
       _ = try await runControl(arguments: ["vision-bridge", "benchmark", tag])
       await refresh()
-      message = "\(tag) tested. The score is on its row."
+      message = routerFormat("%@ tested. The score is on its row.", tag)
     } catch {
       message = error.localizedDescription
     }
@@ -3052,7 +3077,7 @@ final class RouterStore: ObservableObject {
     do {
       _ = try await runControl(arguments: ["local-models", "benchmark", tag])
       await refresh()
-      message = "\(tag) speed measured. Tokens per second is on its row."
+      message = routerFormat("%@ speed measured. Tokens per second is on its row.", tag)
     } catch {
       message = error.localizedDescription
     }
@@ -3144,7 +3169,7 @@ final class RouterStore: ObservableObject {
     let now = Date().timeIntervalSince1970 * 1_000
     let starting = LocalMlxOperation(
       status: "preparing",
-      detail: "Checking the local runtime and downloader",
+      detail: routerLocalized("Checking the local runtime and downloader"),
       percent: 0,
       progressMode: "determinate",
       startedAt: now,
@@ -3165,7 +3190,7 @@ final class RouterStore: ObservableObject {
     } catch {
       localMlx = localMlx?.replacing(operation: LocalMlxOperation(
         status: "error",
-        detail: "The MLX install could not start",
+        detail: routerLocalized("The MLX install could not start"),
         percent: 0,
         progressMode: "determinate",
         startedAt: now,
@@ -3201,11 +3226,14 @@ final class RouterStore: ObservableObject {
       await refresh()
       switch mlx.operation.status {
       case "done":
-        message = "Qwen3.8 27B MLX is ready for Codex. Fully quit and reopen Codex to refresh its picker."
+        message = routerLocalized(
+          "Qwen3.8 27B MLX is ready for Codex. Fully quit and reopen Codex to refresh its picker."
+        )
       case "cancelled":
-        message = "Qwen3.8 27B MLX installation cancelled."
+        message = routerLocalized("Qwen3.8 27B MLX installation cancelled.")
       case "error":
-        message = mlx.operation.error ?? mlx.operation.detail ?? "The MLX installation failed."
+        message = mlx.operation.error ?? mlx.operation.detail
+          ?? routerLocalized("The MLX installation failed.")
       default:
         break
       }
@@ -3220,7 +3248,9 @@ final class RouterStore: ObservableObject {
     do {
       _ = try await runControl(arguments: ["local-models", "runtime", "update", "--yes"])
       await refresh()
-      message = "Ollama updated. Its headless server will be reused for local models."
+      message = routerLocalized(
+        "Ollama updated. Its headless server will be reused for local models."
+      )
     } catch {
       message = error.localizedDescription
     }
@@ -3236,25 +3266,26 @@ final class RouterStore: ObservableObject {
       localDownload = state
       guard let state else {
         localModelOperation = nil
-        message = "No local model operation is running."
+        message = routerLocalized("No local model operation is running.")
         return
       }
       if state.isRunning { continue }
       await refresh()
       let isUninstall = state.isUninstalling || localModelOperation?.tag == state.tag
+      let tag = state.tag ?? "Model"
       switch state.status {
       case "done":
         message = isUninstall
-          ? "\(state.tag ?? "Model") was removed."
-          : "\(state.tag ?? "Model") ready for Codex. Restart Codex to refresh its picker."
+          ? routerFormat("%@ was removed.", tag)
+          : routerFormat("%@ ready for Codex. Restart Codex to refresh its picker.", tag)
       case "cancelled":
         message = isUninstall
-          ? "\(state.tag ?? "Model") removal cancelled."
-          : "\(state.tag ?? "Model") download cancelled."
+          ? routerFormat("%@ removal cancelled.", tag)
+          : routerFormat("%@ download cancelled.", tag)
       default:
         message = state.error ?? (isUninstall
-          ? "The local model removal failed."
-          : "The local model download failed.")
+          ? routerLocalized("The local model removal failed.")
+          : routerLocalized("The local model download failed."))
       }
       localModelOperation = nil
       return
@@ -3273,8 +3304,11 @@ final class RouterStore: ObservableObject {
       // catches up, then report what happened.
       await refresh()
       message = state.status == "done"
-        ? "\(state.tag ?? "Model") downloaded. Restart Codex to refresh its picker."
-        : (state.error ?? "The download failed.")
+        ? routerFormat(
+          "%@ downloaded. Restart Codex to refresh its picker.",
+          state.tag ?? "Model"
+        )
+        : (state.error ?? routerLocalized("The download failed."))
       visionDownload = nil
       return
     }
@@ -3282,7 +3316,7 @@ final class RouterStore: ObservableObject {
 
   private func applyModelSettings(
     arguments: [String],
-    successMessage: String = "Model settings applied. Restart Codex to refresh its picker."
+    successMessage: String = routerLocalized("Model settings applied. Restart Codex to refresh its picker.")
   ) async {
     guard providerOperation == nil else { return }
     providerOperation = "models"
@@ -3346,11 +3380,10 @@ final class RouterStore: ObservableObject {
 
   private func refreshActivity() async {
     do {
-      // `control health` uses the protected health leaf and projects away the
-      // forwarders' credential metadata. The public `/health` endpoint is
-      // intentionally too small for the service rows below.
-      let data = try await runControl(arguments: ["health", "--json"])
-      let health = try JSONDecoder().decode(RouterHealth.self, from: data)
+      // The protected health leaf, read natively. The public `/health` endpoint
+      // is intentionally too small for the service rows below, and this poll
+      // runs once a second, so it must not spawn a process: see RouterHealthProbe.
+      let health = try await RouterHealthProbe.read()
       let previousActivityState = activityState
       let nextActiveRequests = health.activity.active ?? []
       let nextActiveRequestCount = health.activity.activeCount ?? nextActiveRequests.count
@@ -3522,12 +3555,12 @@ final class RouterStore: ObservableObject {
       ?? workspace.urlForApplication(withBundleIdentifier: bundleIdentifier)
 
     guard let applicationURL else {
-      throw RouterError("the Codex desktop app could not be found")
+      throw RouterError(routerLocalized("the Codex desktop app could not be found"))
     }
 
     for application in runningApplications where !application.isTerminated {
       guard application.terminate() else {
-        throw RouterError("Codex did not accept a graceful quit request")
+        throw RouterError(routerLocalized("Codex did not accept a graceful quit request"))
       }
     }
 
@@ -3537,7 +3570,7 @@ final class RouterStore: ObservableObject {
     }
 
     guard runningApplications.allSatisfy({ $0.isTerminated }) else {
-      throw RouterError("Codex did not quit in time; restart it manually")
+      throw RouterError(routerLocalized("Codex did not quit in time; restart it manually"))
     }
 
     let configuration = NSWorkspace.OpenConfiguration()
@@ -3569,14 +3602,16 @@ final class RouterStore: ObservableObject {
 
   private func launchDetachedTrayRefresh(after arguments: [String]) throws {
     guard RouterControlContractPolicy.requiresDetachedTrayRefresh(arguments) else {
-      throw RouterError("This maintenance command does not schedule a desktop refresh.")
+      throw RouterError(
+        routerLocalized("This maintenance command does not schedule a desktop refresh.")
+      )
     }
     try launchDetachedTrayCommand("refresh")
   }
 
   private func launchDetachedTrayCommand(_ action: String) throws {
     guard action == "refresh" || action == "rebuild" else {
-      throw RouterError("Unsupported detached tray command.")
+      throw RouterError(routerLocalized("Unsupported detached tray command."))
     }
     let root = try sourceRoot()
     let task = Process()
@@ -3674,7 +3709,9 @@ final class RouterStore: ObservableObject {
           contents: nil,
           attributes: [.posixPermissions: 0o600]
         ) else {
-          throw RouterError("Could not create the private maintenance error log.")
+          throw RouterError(
+            routerLocalized("Could not create the private maintenance error log.")
+          )
         }
         durableErrorURL = url
         durableErrorHandle = try FileHandle(forUpdating: url)
@@ -3729,12 +3766,18 @@ final class RouterStore: ObservableObject {
       }
       if watchdog.didTimeOut {
         throw RouterError(
-          "Codex Router control command exceeded its absolute deadline and was stopped."
+          routerLocalized(
+            "Codex Router control command exceeded its absolute deadline and was stopped."
+          )
         )
       }
       guard task.terminationStatus == 0 else {
         let detail = String(data: stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        throw RouterError(detail?.isEmpty == false ? detail! : "Codex Router control command failed.")
+        throw RouterError(
+          detail?.isEmpty == false
+            ? detail!
+            : routerLocalized("Codex Router control command failed.")
+        )
       }
       return stdout
     }.value
@@ -3750,7 +3793,7 @@ final class RouterStore: ObservableObject {
     timeout: TimeInterval
   ) async throws -> Data {
     guard ["model-discovery.mjs", "curate-models.mjs"].contains(script) else {
-      throw RouterError("Unsupported Codex Router script.")
+      throw RouterError(routerLocalized("Unsupported Codex Router script."))
     }
     let root = try sourceRoot()
     if script == "curate-models.mjs" {
@@ -3811,13 +3854,18 @@ final class RouterStore: ObservableObject {
       let stderr = await stderrReader.value
       if watchdog.didTimeOut {
         throw RouterError(
-          "\(script) did not answer within \(Int(timeout.rounded())) seconds and was stopped. "
-            + "The provider may be unreachable; try again."
+          routerFormat(
+            "%@ did not answer within %d seconds and was stopped. The provider may be unreachable; try again.",
+            script,
+            Int(timeout.rounded())
+          )
         )
       }
       guard task.terminationStatus == 0 else {
         let detail = String(data: stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        throw RouterError(detail?.isEmpty == false ? detail! : "Codex Router command failed.")
+        throw RouterError(
+          detail?.isEmpty == false ? detail! : routerLocalized("Codex Router command failed.")
+        )
       }
       return stdout
     }.value
@@ -3858,7 +3906,9 @@ final class RouterStore: ObservableObject {
       if let root = try? validatedSourceRoot(candidate) { return root }
     }
     throw RouterError(
-      "Cannot find the installed Codex Router checkout. Install the router or rebuild this app from its checkout."
+      routerLocalized(
+        "Cannot find the installed Codex Router checkout. Install the router or rebuild this app from its checkout."
+      )
     )
   }
 
@@ -3876,8 +3926,9 @@ final class RouterStore: ObservableObject {
       expectedProtocol: expectedProtocol
     ) else {
       throw RouterError(
-        "This Codex Router app does not match the installed router control protocol. "
-          + "Install or update the router and desktop app from the same build, then reopen the app."
+        routerLocalized(
+          "This Codex Router app does not match the installed router control protocol. Install or update the router and desktop app from the same build, then reopen the app."
+        )
       )
     }
   }
@@ -3897,7 +3948,11 @@ final class RouterStore: ObservableObject {
         trustedOwnerAndMode(attributes),
         !executable || FileManager.default.isExecutableFile(atPath: url.path)
       else {
-        throw RouterError("The Codex Router checkout is missing or has unsafe ownership or permissions.")
+        throw RouterError(
+          routerLocalized(
+            "The Codex Router checkout is missing or has unsafe ownership or permissions."
+          )
+        )
       }
     }
     return resolvedRoot
@@ -3912,21 +3967,10 @@ final class RouterStore: ObservableObject {
   }
 
   private func recordedInstallSourceRoot() -> URL? {
-    let environment = ProcessInfo.processInfo.environment
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let stateDirectory: URL
-    if let configured = environment["MODEL_ROUTER_STATE_DIR"]
-      ?? environment["CODEX_ROUTER_STATE_DIR"]
-      ?? environment["KIMI_CODEX_STATE_DIR"],
-      !configured.isEmpty
-    {
-      stateDirectory = URL(fileURLWithPath: configured, isDirectory: true)
-    } else {
-      let codexHome = environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : $0 }
-        .map { URL(fileURLWithPath: $0, isDirectory: true) }
-        ?? home.appendingPathComponent(".codex", isDirectory: true)
-      stateDirectory = codexHome.appendingPathComponent("codex-router", isDirectory: true)
-    }
+    let stateDirectory = RouterStateDirectory.resolve(
+      environment: ProcessInfo.processInfo.environment,
+      home: FileManager.default.homeDirectoryForCurrentUser
+    )
     return RouterInstallManifestPolicy.sourceRoot(stateDirectory: stateDirectory)
   }
 }
@@ -3945,6 +3989,99 @@ private struct RouterHealth: Decodable, Equatable {
 private struct RouterServiceHealth: Decodable, Equatable {
   let reachable: Bool?
   let enabled: Bool?
+}
+
+// paths.mjs: MODEL_ROUTER_STATE_DIR, then the managed aliases, then
+// `$CODEX_HOME/codex-router` with CODEX_HOME defaulting to `~/.codex`. An empty
+// value falls through exactly as `||` does in Node.
+enum RouterStateDirectory {
+  static func resolve(environment: [String: String], home: URL) -> URL {
+    let configured = ["MODEL_ROUTER_STATE_DIR", "CODEX_ROUTER_STATE_DIR", "KIMI_CODEX_STATE_DIR"]
+      .compactMap { environment[$0] }
+      .first { !$0.isEmpty }
+    if let configured {
+      return URL(fileURLWithPath: configured, isDirectory: true)
+    }
+    let codexHome = environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+      .map { URL(fileURLWithPath: $0, isDirectory: true) }
+      ?? home.appendingPathComponent(".codex", isDirectory: true)
+    return codexHome.appendingPathComponent("codex-router", isDirectory: true)
+  }
+}
+
+// The tray polls health once a second. `bin/control health --json` boots Node
+// and control.mjs's whole module graph to make one loopback GET: about a second
+// of CPU per call, so the poll alone kept a core busy for as long as the tray
+// ran. This is the same GET against the same protected leaf, natively, in about
+// a millisecond. control-health.mjs stays the contract for the CLI and the
+// Control Center; RouterHealth's Decodable keys are that same projection, so the
+// forwarders' credential metadata still never reaches tray state.
+enum RouterHealthProbe {
+  private static let session: URLSession = {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 3
+    configuration.timeoutIntervalForResource = 3
+    // The caller key is a path segment. This request never leaves loopback, so
+    // never hand it to a system proxy that claims 127.0.0.1.
+    configuration.connectionProxyDictionary = [kCFNetworkProxiesHTTPEnable as AnyHashable: 0]
+    return URLSession(configuration: configuration)
+  }()
+
+  // paths.mjs `port()`: the first non-empty alias wins, and an invalid value is
+  // an error rather than a fallback to the default. Node parses the value with
+  // `Number()`, which accepts surrounding whitespace, `4202.0`, and `4.202e3`;
+  // parse as a Double first so a port the router accepted is accepted here.
+  static func routerPort(environment: [String: String]) throws -> Int {
+    let value = ["MODEL_ROUTER_PORT", "CODEX_ROUTER_PORT", "KIMI_ROUTER_PORT"]
+      .compactMap { environment[$0] }
+      .first { !$0.isEmpty } ?? "4202"
+    guard let number = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+      number.isFinite, number == number.rounded(), number >= 1, number <= 65_535
+    else {
+      throw RouterError(routerLocalized("MODEL_ROUTER_PORT must be a TCP port between 1 and 65535."))
+    }
+    return Int(number)
+  }
+
+  // caller-auth.mjs `validCallerSecret`: at least 32 characters of [A-Za-z0-9_-].
+  static func callerSecret(stateDirectory: URL) -> String? {
+    let path = stateDirectory.appendingPathComponent("caller-secret", isDirectory: false)
+    guard let secret = (try? String(contentsOf: path, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+      secret.range(of: "^[A-Za-z0-9_-]{32,}$", options: .regularExpression) != nil
+    else { return nil }
+    return secret
+  }
+
+  static func healthURL(environment: [String: String], home: URL) throws -> URL {
+    let port = try routerPort(environment: environment)
+    let stateDirectory = RouterStateDirectory.resolve(environment: environment, home: home)
+    guard let secret = callerSecret(stateDirectory: stateDirectory) else {
+      throw RouterError(
+        routerLocalized("The local router caller key is missing or invalid; run ./bin/doctor --fix.")
+      )
+    }
+    guard let url = URL(string: "http://127.0.0.1:\(port)/_codex-router/\(secret)/v1/health") else {
+      throw RouterError(routerLocalized("The local router health URL could not be built."))
+    }
+    return url
+  }
+
+  fileprivate static func read() async throws -> RouterHealth {
+    var request = URLRequest(
+      url: try healthURL(
+        environment: ProcessInfo.processInfo.environment,
+        home: FileManager.default.homeDirectoryForCurrentUser
+      )
+    )
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    // A 503 still carries the degraded list and the service rows, so decode
+    // every response and let the body's own `ok` say whether the router is
+    // ready. Transport failures throw, which the caller records as a health
+    // failure exactly as it did when `control health` could not run.
+    let (data, _) = try await session.data(for: request)
+    return try JSONDecoder().decode(RouterHealth.self, from: data)
+  }
 }
 
 private enum TrayServiceHealthState: Equatable {
@@ -4403,12 +4540,12 @@ struct CodexRateLimitWindow: Decodable, Equatable {
       let days = minutes / 1_440
       if days == 1 { return routerLocalized("Daily limit") }
       if days == 7 { return routerLocalized("Weekly limit") }
-      return RouterLanguage.isSimplifiedChinese ? "\(days) 天限制" : "\(days)-day limit"
+      return routerMessage(.dayLimit, ["count": "\(days)"])
     }
     if minutes >= 60, minutes.isMultiple(of: 60) {
-      return RouterLanguage.isSimplifiedChinese ? "\(minutes / 60) 小时限制" : "\(minutes / 60)-hour limit"
+      return routerMessage(.hourLimit, ["count": "\(minutes / 60)"])
     }
-    return RouterLanguage.isSimplifiedChinese ? "\(minutes) 分钟限制" : "\(minutes)-minute limit"
+    return routerMessage(.minuteLimit, ["count": "\(minutes)"])
   }
 }
 
@@ -4524,6 +4661,43 @@ struct DailyUsageDisplayBucket: Equatable {
   let isRouterFallback: Bool
 }
 
+// Usage days are UTC days. OpenAI's account stream reports dailyUsageBuckets on
+// UTC calendar boundaries and the router keys its own buckets the same way, so
+// this formatter has to read and write that one day space. Leaving it on the
+// device zone made every key mean "the local day of the same name", which east
+// of UTC is a different window than the bucket measured -- and left the current
+// local day with no account bucket to match until the offset elapsed, so an
+// account mid-session reported "today: 0" every morning.
+let usageDayTimeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+
+let dailyUsageDayKeyFormatter: DateFormatter = {
+  let formatter = DateFormatter()
+  formatter.locale = Locale(identifier: "en_US_POSIX")
+  formatter.calendar = Calendar(identifier: .gregorian)
+  formatter.timeZone = usageDayTimeZone
+  formatter.dateFormat = "yyyy-MM-dd"
+  return formatter
+}()
+
+/// The calendar every usage-day walk and label must use, so a point's date, the
+/// key it looks up, and the day it is labelled with all name the same window.
+var usageDayCalendar: Calendar = {
+  var calendar = Calendar(identifier: .gregorian)
+  calendar.timeZone = usageDayTimeZone
+  return calendar
+}()
+
+/// Day labels for a usage chart. A usage point's date is the start of a UTC
+/// day, so formatting it in the device zone can name the day before or after
+/// the one the bucket measured. Label the day the number is actually from.
+extension Date {
+  func usageDayLabel(_ style: Date.FormatStyle) -> String {
+    var dayStyle = style
+    dayStyle.timeZone = usageDayTimeZone
+    return formatted(dayStyle)
+  }
+}
+
 func mergeAccountUsageBuckets(
   account: [CodexDailyUsageBucket],
   router: [ProviderDailyUsageBucket]
@@ -4544,6 +4718,46 @@ func mergeAccountUsageBuckets(
     )
   }
   return merged.values.sorted { $0.startDate < $1.startDate }
+}
+
+/// Pure chart projection. Safe to call from SwiftUI view bodies.
+func dailyUsagePoints(
+  from buckets: [DailyUsageDisplayBucket],
+  days: Int,
+  today: Date,
+  calendar: Calendar = usageDayCalendar
+) -> [DailyUsagePoint] {
+  let indexed = Dictionary(uniqueKeysWithValues: buckets.map { ($0.startDate, $0) })
+  return (0..<days).map { offset in
+    let date = calendar.date(byAdding: .day, value: offset - (days - 1), to: today) ?? today
+    let bucket = indexed[dailyUsageDayKeyFormatter.string(from: date)]
+    return DailyUsagePoint(
+      date: date,
+      tokens: Double(bucket?.tokens ?? 0),
+      isRouterFallback: bucket?.isRouterFallback ?? false
+    )
+  }
+}
+
+/// Pure 7/30-day total. Safe to call from SwiftUI view bodies.
+/// The window boundaries have to be UTC days like the keys they are compared
+/// against; a local window against UTC-parsed keys drops or admits one day at
+/// the edge, by the machine's offset.
+func sumLocalUsageTotals(
+  from buckets: [ProviderDailyUsageBucket],
+  days: Int,
+  today: Date,
+  calendar: Calendar = usageDayCalendar
+) -> (tokens: Double, requests: Int) {
+  let firstDay = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
+  return buckets.reduce(into: (tokens: 0.0, requests: 0)) { totals, bucket in
+    guard let date = dailyUsageDayKeyFormatter.date(from: bucket.startDate),
+          date >= firstDay,
+          date <= today
+    else { return }
+    totals.tokens += Double(bucket.tokens)
+    totals.requests += bucket.requests
+  }
 }
 
 struct RouterTarget: Decodable {
@@ -4634,13 +4848,26 @@ struct ToolResultAgingStats: Decodable {
       // the floor can still be counted here -- and saying "no result over
       // 32 KB (largest 40 KB)" would contradict itself in the same sentence.
       if largestBytes > Self.agingMinBytes {
-        return "Nothing aged yet in \(evaluatedRequests) requests (largest \(largest))"
+        return routerFormat(
+          "Nothing aged yet in %d requests (largest %@)",
+          evaluatedRequests,
+          largest
+        )
       }
-      return "No result over 32 KB in \(evaluatedRequests) requests (largest \(largest))"
+      return routerFormat(
+        "No result over 32 KB in %d requests (largest %@)",
+        evaluatedRequests,
+        largest
+      )
     }
     let tokens = Self.compactCount(estimatedTokensSaved)
     let megabytes = String(format: "%.1f", Double(bytesSaved) / 1_048_576)
-    return "Saved ~\(tokens) tokens (\(megabytes) MB) across \(requests) requests"
+    return routerFormat(
+      "Saved ~%@ tokens (%@ MB) across %d requests",
+      tokens,
+      megabytes,
+      requests
+    )
   }
 
   // Mirrors TOOL_RESULT_AGING_MIN_BYTES in src/tool-result-aging.mjs. Only the
@@ -4685,9 +4912,9 @@ enum SavingsRange: String, CaseIterable {
 
   var caption: String {
     switch self {
-    case .day: return "tokens saved · last 24 hours"
-    case .week: return "tokens saved · last 7 days"
-    case .month: return "tokens saved · last 30 days"
+    case .day: return routerLocalized("tokens saved · last 24 hours")
+    case .week: return routerLocalized("tokens saved · last 7 days")
+    case .month: return routerLocalized("tokens saved · last 30 days")
     }
   }
 
@@ -4712,7 +4939,12 @@ struct ToolResultAgingCache: Decodable {
     guard let agedRate, let unagedRate, let agedTurns, agedTurns > 0 else { return nil }
     let normal = String(format: "%.1f%%", unagedRate * 100)
     let compacted = String(format: "%.1f%%", agedRate * 100)
-    return "Cache \(normal) normal · \(compacted) compacted (n=\(agedTurns))"
+    return routerFormat(
+      "Cache %@ normal · %@ compacted (n=%d)",
+      normal,
+      compacted,
+      agedTurns
+    )
   }
 }
 
@@ -4805,16 +5037,16 @@ struct LocalMlxOperation: Decodable, Equatable {
 
   var stageLabel: String {
     switch status {
-    case "preparing": return "Preparing runtime"
-    case "downloading": return "Downloading model"
-    case "loading": return "Loading model"
-    case "starting-server": return "Starting local server"
-    case "verifying": return "Verifying model"
-    case "publishing": return "Wiring Codex"
-    case "done": return "Ready for Codex"
-    case "cancelled": return "Installation cancelled"
-    case "error": return "Installation failed"
-    default: return "Not installed"
+    case "preparing": return routerLocalized("Preparing runtime")
+    case "downloading": return routerLocalized("Downloading model")
+    case "loading": return routerLocalized("Loading model")
+    case "starting-server": return routerLocalized("Starting local server")
+    case "verifying": return routerLocalized("Verifying model")
+    case "publishing": return routerLocalized("Wiring Codex")
+    case "done": return routerLocalized("Ready for Codex")
+    case "cancelled": return routerLocalized("Installation cancelled")
+    case "error": return routerLocalized("Installation failed")
+    default: return routerLocalized("Not installed")
     }
   }
 }
@@ -5090,20 +5322,94 @@ struct MenuBarSettings: Equatable {
 }
 
 enum MenuBarLayoutMetrics {
-  static let standardReservedWidth: CGFloat = 180
+  // A cap, not a reservation. Standard mode used to hand this width back for
+  // every state, so a short label -- or a hidden model name -- left the unused
+  // remainder as blank menu-bar space before the next item. The slot is now
+  // measured from what is actually drawn and only clamped here, which keeps
+  // long labels truncating exactly as they did.
+  static let standardMaximumWidth: CGFloat = 180
+  // Below this the item is too small to be a comfortable click target, and an
+  // icon that touches both edges reads as clipped rather than compact.
+  static let standardMinimumWidth: CGFloat = 30
   static let standardHeight: CGFloat = 22
   static let standardIconSize: CGFloat = 15
+  // The indicator style draws a 6pt dot instead of the 15pt mark.
+  static let standardIndicatorSize: CGFloat = 6
+  // Mirrors the HStack spacing and the breathing room the fixed slot used to
+  // provide incidentally; measuring has to agree with StatusItemLabel or the
+  // text clips one glyph early.
+  static let standardContentSpacing: CGFloat = 5
+  static let standardHorizontalInset: CGFloat = 6
   static let iconOnlyWidth: CGFloat = standardHeight
   static let iconOnlyHeight: CGFloat = 22
   static let iconOnlyIconSize: CGFloat = standardIconSize
   static let attentionPulseScale: CGFloat = 1.4
   static let standardIndicatorPulseScale: CGFloat = 2.1
 
-  nonisolated static func statusItemWidth(
-    displayMode: TrayMenuBarDisplayMode,
+  // SwiftUI renders these with `.system(size:weight:design:)`; measuring with a
+  // different face would size the slot for text the menu bar never draws.
+  nonisolated static func standardNameFont() -> NSFont {
+    let base = NSFont.systemFont(ofSize: 11, weight: .medium)
+    guard let descriptor = base.fontDescriptor.withDesign(.rounded),
+      let rounded = NSFont(descriptor: descriptor, size: 11)
+    else { return base }
+    return rounded
+  }
+
+  nonisolated static func standardDetailFont() -> NSFont {
+    NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+  }
+
+  nonisolated static func standardTextWidth(_ text: String, font: NSFont) -> CGFloat {
+    guard !text.isEmpty else { return 0 }
+    return ceil((text as NSString).size(withAttributes: [.font: font]).width)
+  }
+
+  /// The width Standard mode needs for the content it is about to draw, capped
+  /// at `standardMaximumWidth` so an overlong label still truncates instead of
+  /// pushing every other menu-bar item aside.
+  nonisolated static func standardContentWidth(
+    iconStyle: TrayMenuBarIconStyle,
+    showModelName: Bool,
+    nameText: String,
+    detailText: String,
     pulsing: Bool = false
   ) -> CGFloat {
-    guard displayMode == .iconOnly else { return standardReservedWidth }
+    var segments: [CGFloat] = [standardLeadingGlyphWidth(iconStyle: iconStyle, pulsing: pulsing)]
+    if showModelName, !nameText.isEmpty {
+      segments.append(standardTextWidth(nameText, font: standardNameFont()))
+    }
+    if !detailText.isEmpty {
+      segments.append(standardTextWidth(detailText, font: standardDetailFont()))
+    }
+    let spacing = standardContentSpacing * CGFloat(max(0, segments.count - 1))
+    let content = segments.reduce(0, +) + spacing + standardHorizontalInset * 2
+    return min(standardMaximumWidth, max(standardMinimumWidth, ceil(content)))
+  }
+
+  // A pulse scales the glyph in place. The slot has to grow with it or the
+  // animation is clipped against its own status item.
+  nonisolated static func standardLeadingGlyphWidth(
+    iconStyle: TrayMenuBarIconStyle,
+    pulsing: Bool
+  ) -> CGFloat {
+    if iconStyle == .indicator {
+      let size = pulsing ? standardIndicatorSize * standardIndicatorPulseScale : standardIndicatorSize
+      return ceil(size)
+    }
+    let size = pulsing ? standardIconSize * attentionPulseScale : standardIconSize
+    return ceil(size)
+  }
+
+  nonisolated static func statusItemWidth(
+    displayMode: TrayMenuBarDisplayMode,
+    pulsing: Bool = false,
+    standardContentWidth: CGFloat? = nil
+  ) -> CGFloat {
+    // No measurement supplied means the caller cannot know the label yet, so
+    // fall back to the historical full slot rather than guessing small and
+    // clipping.
+    guard displayMode == .iconOnly else { return standardContentWidth ?? standardMaximumWidth }
     guard pulsing else { return iconOnlyWidth }
     let iconWidth = iconOnlyIconSize * attentionPulseScale
     return max(iconOnlyWidth, ceil(iconWidth))
@@ -5155,6 +5461,7 @@ struct ProviderSetupState: Decodable, Identifiable, Equatable {
   let credentialLabel: String?
   let disconnectable: Bool?
   let blockedNote: String?
+  let configurationNote: String?
   // Set when connecting successfully still leaves the account unable to use
   // the API, because its plan does not include one. Shown before the buttons
   // rather than after a 403 lands in Codex.
@@ -5230,13 +5537,16 @@ enum ProviderCatalogInput {
     var errorDescription: String? {
       switch self {
       case .emptySelection, .tooManyModels:
-        return "Choose between 1 and \(ProviderCatalogInput.maxModelIDCount) provider models."
+        return routerFormat(
+          "Choose between 1 and %d provider models.",
+          ProviderCatalogInput.maxModelIDCount
+        )
       case .invalidModelID(let id):
-        return "Model id is invalid: \(id)"
+        return routerFormat("Model id is invalid: %@", id)
       case .duplicateModelID:
-        return "Provider model ids must be unique."
+        return routerLocalized("Provider model ids must be unique.")
       case .invalidProviderID(let id):
-        return "Provider is invalid: \(id)"
+        return routerFormat("Provider is invalid: %@", id)
       }
     }
   }
@@ -5405,12 +5715,18 @@ private struct StatusItemLabel: View {
         }
       }
       .frame(
-        width: MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode, pulsing: pulsing),
+        width: MenuBarLayoutMetrics.statusItemWidth(
+          displayMode: store.menuBarDisplayMode,
+          pulsing: pulsing,
+          standardContentWidth: store.menuBarStandardWidth(pulsing: pulsing)
+        ),
         height: MenuBarLayoutMetrics.statusItemHeight(
           displayMode: store.menuBarDisplayMode,
           pulsing: pulsing
         ),
-        alignment: .leading
+        // The slot is measured from this content now, so centring it keeps the
+        // inset even on both sides instead of banking it all as a trailing gap.
+        alignment: .center
       )
       .clipped()
       .help(tooltipText)
@@ -5453,7 +5769,10 @@ enum TrayTab: String, CaseIterable, Identifiable {
 private struct TrayView: View {
   @ObservedObject var store: RouterStore
   @AppStorage("trayTab") private var tab: TrayTab = .usage
-  @State private var providersExpanded = true
+  // The heavy settings sections all start closed. Each one builds tens to
+  // hundreds of rows, and opening the tray or switching to Settings paid for
+  // every one of them at once even though a given visit usually touches one.
+  @State private var providersExpanded = false
   @State private var providerFilter = ""
   @State private var savingsRange: SavingsRange = .day
   @State private var savingsRangeSelectedByUser = false
@@ -5493,7 +5812,11 @@ private struct TrayView: View {
   private var providerDashboardSummary: String {
     if let dashboard = store.snapshot.dashboard, !dashboard.providers.isEmpty {
       let enabled = dashboard.providers.filter(\.enabled).count
-      return "\(enabled)/\(dashboard.providers.count) routes enabled"
+      return routerFormat(
+        "%d/%d routes enabled",
+        enabled,
+        dashboard.providers.count
+      )
     }
     return routerLocalized("Auto-saved")
   }
@@ -5655,7 +5978,7 @@ private struct TrayView: View {
     }
     .foregroundStyle(routerText)
     .task {
-      await store.refresh()
+      await store.refreshIfStale()
       selectInitialSavingsRange()
     }
     .onChange(of: savingsRangeDataFingerprint) { _ in
@@ -5723,7 +6046,10 @@ private struct TrayView: View {
       .id(store.language)
 
       ScrollView(showsIndicators: false) {
-        VStack(alignment: .leading, spacing: 14) {
+        // Lazy, because this column is the whole tab: a plain VStack lays out
+        // every section before the first frame, so the sections below the fold
+        // cost the same as the one being read.
+        LazyVStack(alignment: .leading, spacing: 14) {
           switch tab {
           case .usage: usageTab
           case .status: statusTab
@@ -5750,7 +6076,11 @@ private struct TrayView: View {
     if !store.overallModelUsage.isEmpty {
       sectionLabel(
         routerLocalized("Tokens by model"),
-        detail: "\(compactTokenCount(Double(store.overallTokenTotal))) tok · \(store.overallRequestTotal) req"
+        detail: routerFormat(
+          "%@ tok · %d req",
+          compactTokenCount(Double(store.overallTokenTotal)),
+          store.overallRequestTotal
+        )
       )
       ModelUsageBreakdown(store: store)
     }
@@ -5865,16 +6195,19 @@ private struct TrayView: View {
       let range = agingStats.ranges?[savingsRange.rawValue]
       let rangeRequests = range?.requests ?? 0
       let allTimeTokens = agingStats.estimatedTokensSaved ?? 0
-      sectionLabel("Context savings", detail: "\(agedRequests) requests compacted all-time")
+      sectionLabel(
+        routerLocalized("Context savings"),
+        detail: routerFormat("%d requests compacted all-time", agedRequests)
+      )
       VStack(alignment: .leading, spacing: 8) {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
           VStack(alignment: .leading, spacing: 2) {
-            Text("Tool results compressed into recoverable receipts")
+            Text(routerLocalized("Tool results compressed into recoverable receipts"))
               .font(.system(size: 10, weight: .medium))
               .lineLimit(1)
             Text(rangeRequests > 0
-              ? "\(rangeRequests) compacted requests in this window"
-              : "No compactions in this window")
+              ? routerFormat("%d compacted requests in this window", rangeRequests)
+              : routerLocalized("No compactions in this window"))
               .font(.system(size: 8))
               .foregroundStyle(routerMuted)
               .lineLimit(1)
@@ -5900,11 +6233,11 @@ private struct TrayView: View {
                 .buttonStyle(.plain)
               }
             }
-            Text("~\(compactTokenCount(Double(allTimeTokens))) tok")
+            Text(routerFormat("~%@ tok", compactTokenCount(Double(allTimeTokens))))
               .font(.system(size: 15, weight: .semibold, design: .monospaced))
               .foregroundStyle(routerMint)
               .monospacedDigit()
-            Text("saved all-time")
+            Text(routerLocalized("saved all-time"))
               .font(.system(size: 7.5))
               .foregroundStyle(routerMuted)
           }
@@ -5916,7 +6249,7 @@ private struct TrayView: View {
             bucketUnit: savingsRange.bucketUnit
           )
         } else {
-          Text("Nothing compacted in this window")
+          Text(routerLocalized("Nothing compacted in this window"))
             .font(.system(size: 8))
             .foregroundStyle(routerMuted)
         }
@@ -6012,7 +6345,9 @@ private struct TrayView: View {
     guard store.routerHealth != nil else { return routerLocalized("Checking") }
     let attention = serviceHealthRows.filter { $0.state == .offline || $0.state == .degraded }.count
     if attention > 0 {
-      return "\(attention) \(routerLocalized(attention == 1 ? "dependency needs attention" : "dependencies need attention"))"
+      return attention == 1
+        ? routerFormat("%d dependency needs attention", attention)
+        : routerFormat("%d dependencies need attention", attention)
     }
     return routerLocalized("All clear")
   }
@@ -6031,7 +6366,9 @@ private struct TrayView: View {
       } else if !degraded.isEmpty {
         routerState = .degraded
         routerStatus = routerLocalized("Degraded")
-        routerDetail = "\(degraded.count) \(routerLocalized(degraded.count == 1 ? "dependency needs attention" : "dependencies need attention"))"
+        routerDetail = degraded.count == 1
+          ? routerFormat("%d dependency needs attention", degraded.count)
+          : routerFormat("%d dependencies need attention", degraded.count)
       } else {
         routerState = .offline
         routerStatus = routerLocalized("Offline")
@@ -6125,10 +6462,10 @@ private struct TrayView: View {
     guard store.activeRequestCount > 0 else { return routerLocalized("No traffic right now") }
     let chats = store.activeChatCount
     let requests = store.activeRequestCount
-    if RouterLanguage.isSimplifiedChinese {
-      return "\(chats) 个会话 · \(requests) 个请求进行中"
-    }
-    return "\(chats) chat\(chats == 1 ? "" : "s") · \(requests) request\(requests == 1 ? "" : "s") in flight"
+    let key: RouterMessageKey = chats == 1
+      ? (requests == 1 ? .activityBothOne : .activityChatOne)
+      : (requests == 1 ? .activityRequestOne : .activityMany)
+    return routerMessage(key, ["chats": "\(chats)", "requests": "\(requests)"])
   }
 
   private var activeModelLabel: String {
@@ -6152,9 +6489,7 @@ private struct TrayView: View {
       .speedSampleCount ?? 0
     return sampleCount == 0
       ? routerLocalized("No samples")
-      : RouterLanguage.isSimplifiedChinese
-        ? "\(sampleCount) 条回复"
-        : "\(sampleCount) reply\(sampleCount == 1 ? "" : "s")"
+      : routerMessage(sampleCount == 1 ? .sampleRepliesOne : .sampleReplies, ["count": "\(sampleCount)"])
   }
 
   private var speedExplanation: String {
@@ -6402,9 +6737,11 @@ private struct TrayView: View {
     .padding(.vertical, 2)
     settingRow(
       title: routerLocalized("Use Router with ChatGPT"),
-      detail: store.signedRoutingEnabled(authoritative: store.signedRouting)
-        ? routerLocalized("Native GPT + external models · task history preserved")
-        : routerLocalized("Keep ChatGPT login and the current task history"),
+      detail: store.loginFreeEnabled(authoritative: store.loginFree)
+        ? routerLocalized("Turn off 'Use without OpenAI login' first")
+        : (store.signedRoutingEnabled(authoritative: store.signedRouting)
+          ? routerLocalized("Native GPT + external models · task history preserved")
+          : routerLocalized("Keep ChatGPT login and the current task history")),
       isOn: Binding(
         get: { store.signedRoutingEnabled(authoritative: store.signedRouting) },
         set: { enabled in store.setSignedRouting(enabled) }
@@ -6459,9 +6796,11 @@ private struct TrayView: View {
     }
     settingRow(
       title: routerLocalized("Use without OpenAI login"),
-      detail: store.loginFreeEnabled(authoritative: store.loginFree)
-        ? routerLocalized("External providers · Codex restarts automatically")
-        : routerLocalized("Use connected models and restart Codex"),
+      detail: store.signedRoutingEnabled(authoritative: store.signedRouting)
+        ? routerLocalized("Turn off 'Use Router with ChatGPT' first")
+        : (store.loginFreeEnabled(authoritative: store.loginFree)
+          ? routerLocalized("External providers · Codex restarts automatically")
+          : routerLocalized("Use connected models and restart Codex")),
       isOn: Binding(
         get: { store.loginFreeEnabled(authoritative: store.loginFree) },
         set: { enabled in store.setLoginFree(enabled) }
@@ -6579,13 +6918,14 @@ private struct TrayView: View {
   private struct ModelSettingsAccordion: View {
     @ObservedObject var store: RouterStore
     let target: RouterTarget
-    @State private var subagentsExpanded = true
-    @State private var pickerExpanded = true
-    @State private var providerCatalogsExpanded = true
-    @State private var visionExpanded = true
-    // Local models are a first-class install surface. Keep this section open
-    // on launch so the catalog is not hidden behind the other settings cards.
-    @State private var localLlmExpanded = true
+    @State private var subagentsExpanded = false
+    @State private var pickerExpanded = false
+    @State private var providerCatalogsExpanded = false
+    @State private var visionExpanded = false
+    // Local models are a first-class install surface, but the catalog it draws
+    // is one of the most expensive sections in the panel. The header keeps it
+    // discoverable; opening it is one click and now only costs when asked for.
+    @State private var localLlmExpanded = false
     @State private var localDetailsExpanded = false
     @State private var expandedLocalFamilies = Set<String>()
     @State private var expandedLocalVariants = Set<String>()
@@ -6599,7 +6939,12 @@ private struct TrayView: View {
     // the tag rather than a Bool so the alert can name the model.
     @State private var pendingOversizedInstall: String?
     @State private var quickPicksExpanded = false
-    @State private var collapsedProviders = Set<String>()
+    // Opt-in rather than opt-out. Every group defaulting to expanded meant a
+    // tap on Settings built every model row the registry knows about -- the
+    // subagent and picker panels list the same 185 models, so roughly 450
+    // toggle rows -- before the tab could draw. The set now names only the
+    // groups the operator actually opened.
+    @State private var expandedProviders = Set<String>()
 
     private struct ProviderModels: Identifiable {
       let provider: String
@@ -6690,12 +7035,12 @@ private struct TrayView: View {
     private func providerBinding(_ section: String, _ provider: String) -> Binding<Bool> {
       let key = "\(section):\(provider)"
       return Binding(
-        get: { !collapsedProviders.contains(key) },
+        get: { expandedProviders.contains(key) },
         set: { expanded in
           if expanded {
-            collapsedProviders.remove(key)
+            expandedProviders.insert(key)
           } else {
-            collapsedProviders.insert(key)
+            expandedProviders.remove(key)
           }
         }
       )
@@ -6722,8 +7067,8 @@ private struct TrayView: View {
             toggleRow(
               title: routerLocalized("All proven models"),
               detail: store.subagentModeAll(authoritative: settings?.subagents.mode == "all")
-                ? "Every proven v2 model can run as a subagent"
-                : "Only selected proven v2 models can run as subagents",
+                ? routerLocalized("Every proven v2 model can run as a subagent")
+                : routerLocalized("Only selected proven v2 models can run as subagents"),
               isOn: Binding(
                 get: {
                   store.subagentModeAll(authoritative: settings?.subagents.mode == "all")
@@ -6920,10 +7265,7 @@ private struct TrayView: View {
         Button(routerLocalized("Cancel"), role: .cancel) { pendingOversizedInstall = nil }
       } message: { tag in
         Text(
-          RouterLanguage.isSimplifiedChinese
-            ? "\(tag) 对本机内存或可用磁盘空间来说过大。仍会下载，但可能无法加载或运行非常缓慢。"
-            : "\(tag) is rated too large for this machine's memory or free disk. "
-              + "It will download, but it may fail to load or run very slowly."
+          routerMessage(.oversizeWarning, ["tag": "\(tag)"])
         )
       }
     }
@@ -7042,20 +7384,29 @@ private struct TrayView: View {
       let active = operation?.isRunning == true
       let tint = failed || cancelled || unsupported ? routerRed : (ready ? routerMint : routerYellow)
 
-      downloadHeader("QWEN MLX", detail: "LM Studio · 4-bit · ~15 GB")
+      downloadHeader(
+        "QWEN MLX",
+        detail: routerLocalized("LM Studio · 4-bit · ~15 GB")
+      )
       VStack(alignment: .leading, spacing: 7) {
         HStack(alignment: .top, spacing: 8) {
           VStack(alignment: .leading, spacing: 2) {
             Text("Qwen3.8 27B Uncensored")
               .font(.system(size: 11, weight: .semibold))
-            Text(mlx?.model.map { "\($0.precision) MLX · \($0.contextLength / 1024)K context" }
-              ?? "4-bit MLX · 32K context · Apple silicon")
+            Text(mlx?.model.map {
+              routerFormat(
+                "%@ MLX · %dK context",
+                $0.precision,
+                $0.contextLength / 1024
+              )
+            }
+              ?? routerLocalized("4-bit MLX · 32K context · Apple silicon"))
               .font(.system(size: 8))
               .foregroundStyle(routerMutedStrong)
           }
           Spacer(minLength: 6)
           if ready {
-            Label("Ready", systemImage: "checkmark.circle.fill")
+            Label(routerLocalized("Ready"), systemImage: "checkmark.circle.fill")
               .font(.system(size: 8, weight: .semibold))
               .foregroundStyle(routerMint)
           }
@@ -7068,7 +7419,7 @@ private struct TrayView: View {
               .font(.system(size: 9, weight: .semibold))
               .foregroundStyle(tint)
             Spacer(minLength: 4)
-            Button("Cancel", role: .cancel) {
+            Button(routerLocalized("Cancel"), role: .cancel) {
               Task { await store.cancelLocalMlx() }
             }
             .buttonStyle(.borderless)
@@ -7101,7 +7452,10 @@ private struct TrayView: View {
           Label(operation.stageLabel, systemImage: "exclamationmark.triangle.fill")
             .font(.system(size: 9, weight: .semibold))
             .foregroundStyle(routerRed)
-          Text(operation.error ?? operation.detail ?? "The local MLX setup did not complete.")
+          Text(
+            operation.error ?? operation.detail
+              ?? routerLocalized("The local MLX setup did not complete.")
+          )
             .font(.system(size: 8))
             .foregroundStyle(routerRed)
             .lineLimit(3)
@@ -7111,34 +7465,47 @@ private struct TrayView: View {
             .foregroundStyle(routerMutedStrong)
             .lineLimit(1)
             .truncationMode(.middle)
-          Text("Served only on this Mac and published to the Codex model picker.")
+          Text(routerLocalized("Served only on this Mac and published to the Codex model picker."))
             .font(.system(size: 8))
             .foregroundStyle(routerMuted)
         } else if unsupported {
-          Label("Apple silicon required", systemImage: "cpu")
+          Label(routerLocalized("Apple silicon required"), systemImage: "cpu")
             .font(.system(size: 9, weight: .semibold))
             .foregroundStyle(routerRed)
-          Text(mlx?.host?.reason ?? "This MLX model is available only on Apple silicon Macs.")
+          Text(
+            mlx?.host?.reason
+              ?? routerLocalized("This MLX model is available only on Apple silicon Macs.")
+          )
             .font(.system(size: 8))
             .foregroundStyle(routerRed)
             .lineLimit(3)
           if let host = mlx?.host {
-            Text("Detected: \(host.platform) · \(host.arch)")
+            Text(routerFormat("Detected: %@ · %@", host.platform, host.arch))
               .font(.system(size: 8, design: .monospaced))
               .foregroundStyle(routerMuted)
           }
         } else {
-          localMlxPrerequisiteLine("LM Studio runtime", state: mlx?.prerequisites?.lms)
-          localMlxPrerequisiteLine("Model downloader", state: mlx?.prerequisites?.uvx)
+          localMlxPrerequisiteLine(
+            routerLocalized("LM Studio runtime"),
+            state: mlx?.prerequisites?.lms
+          )
+          localMlxPrerequisiteLine(
+            routerLocalized("Model downloader"),
+            state: mlx?.prerequisites?.uvx
+          )
         }
 
-        Text("Reduced safety guardrails. Treat outputs as untrusted and keep the server local.")
+        Text(
+          routerLocalized(
+            "Reduced safety guardrails. Treat outputs as untrusted and keep the server local."
+          )
+        )
           .font(.system(size: 8))
           .foregroundStyle(routerYellow)
           .lineLimit(2)
 
         if !active && !ready {
-          Button("Install runtime + ~15 GB model and wire Codex") {
+          Button(routerLocalized("Install runtime + ~15 GB model and wire Codex")) {
             Task { await store.installLocalMlx() }
           }
           .buttonStyle(.borderedProminent)
@@ -7146,8 +7513,11 @@ private struct TrayView: View {
           .tint(routerMint)
           .disabled(unsupported || busy || store.localDownload?.isRunning == true || store.localModelOperation != nil)
           .help(unsupported
-            ? (mlx?.host?.reason ?? "This MLX model requires an Apple silicon Mac.")
-            : "Installs official local prerequisites when missing, downloads the curated 4-bit model, and publishes it through Codex Router.")
+            ? (mlx?.host?.reason
+              ?? routerLocalized("This MLX model requires an Apple silicon Mac."))
+            : routerLocalized(
+              "Installs official local prerequisites when missing, downloads the curated 4-bit model, and publishes it through Codex Router."
+            ))
         }
       }
       .padding(8)
@@ -7165,8 +7535,10 @@ private struct TrayView: View {
         Text(label)
         Spacer()
         Text(state?.available == true
-          ? "ready"
-          : (state?.automaticWithYes == true ? "official installer on click" : "required"))
+          ? routerLocalized("ready")
+          : (state?.automaticWithYes == true
+            ? routerLocalized("official installer on click")
+            : routerLocalized("required")))
           .foregroundStyle(routerMuted)
       }
       .font(.system(size: 8))
@@ -7178,7 +7550,7 @@ private struct TrayView: View {
       } else if state?.available != true,
         let source = state?.source,
         let host = URL(string: source)?.host {
-        Text("Source: \(host)")
+        Text(routerFormat("Source: %@", host))
           .font(.system(size: 8))
           .foregroundStyle(routerMuted)
       }
@@ -7198,7 +7570,7 @@ private struct TrayView: View {
             .truncationMode(.middle)
         }
         Spacer(minLength: 4)
-        Button("Cancel", role: .cancel) {
+        Button(routerLocalized("Cancel"), role: .cancel) {
           Task { await store.cancelLocalModel(operation.tag) }
         }
         .buttonStyle(.borderless)
@@ -7221,7 +7593,12 @@ private struct TrayView: View {
       let installedCount = sortedLocalModels.count
       let detail = installedCount == 0
         ? routerLocalized("none installed")
-        : "\(installedCount) \(routerLocalized("installed")) · \(String(format: "%.1f", localModels?.totalGb ?? 0)) GB"
+        : routerFormat(
+          "%d %@ · %.1f GB",
+          installedCount,
+          routerLocalized("installed"),
+          localModels?.totalGb ?? 0
+        )
       downloadHeader("ON THIS MAC", detail: detail)
       if sortedLocalModels.isEmpty {
         Text(routerLocalized("Nothing installed yet. Start with a quick pick or browse the Ollama catalog below."))
@@ -7274,9 +7651,7 @@ private struct TrayView: View {
           Button(
             quickPicksExpanded
               ? routerLocalized("Show fewer quick picks")
-              : (RouterLanguage.isSimplifiedChinese
-                  ? "再显示 \(quickPickRemainingCount) 个快速选项"
-                  : "Show \(quickPickRemainingCount) more quick picks")
+              : (routerMessage(.moreQuickPicks, ["count": "\(quickPickRemainingCount)"]))
           ) {
             withAnimation(.easeOut(duration: 0.15)) { quickPicksExpanded.toggle() }
           }
@@ -7296,18 +7671,15 @@ private struct TrayView: View {
         .count
       let showingAllCatalog = localCatalogFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       let shownCloudCount = showingAllCatalog ? cloudCount : visibleCloudCount
-      let catalogDetail = RouterLanguage.isSimplifiedChinese
-        ? (showingAllCatalog
-            ? "\(localCatalogFamilies.count) 个系列 · \(explore.count) 个标签"
-            : "\(localCatalogFamilies.count) 个系列 · \(visibleTagCount) 个匹配")
-        : (showingAllCatalog
-            ? "\(localCatalogFamilies.count) families · \(explore.count) tags"
-            : "\(localCatalogFamilies.count) families · \(visibleTagCount) matches")
+      let catalogDetail = routerMessage(showingAllCatalog ? .catalogSummary : .catalogMatches, [
+        "families": "\(localCatalogFamilies.count)",
+        "count": "\(showingAllCatalog ? explore.count : visibleTagCount)",
+      ])
       downloadHeader(
         "DISCOVER OLLAMA",
         detail: catalogDetail +
           (shownCloudCount > 0
-            ? (RouterLanguage.isSimplifiedChinese ? " · \(shownCloudCount) 个仅云端" : " · \(shownCloudCount) cloud-only")
+            ? (routerMessage(.cloudCountSuffix, ["count": "\(shownCloudCount)"]))
             : "")
       )
       Button(routerLocalized(variantHelpExpanded ? "Hide tag guide" : "What do these tags mean?")) {
@@ -7336,9 +7708,7 @@ private struct TrayView: View {
       }
       if localCatalogFamilies.isEmpty {
         Text(
-          RouterLanguage.isSimplifiedChinese
-            ? "没有匹配“\(localCatalogFilter)”的 Ollama 标签。"
-            : "No Ollama tags match \"\(localCatalogFilter)\"."
+          routerMessage(.noOllamaMatches, ["query": "\(localCatalogFilter)"])
         )
           .font(.system(size: 9))
           .foregroundStyle(routerMutedStrong)
@@ -7466,9 +7836,7 @@ private struct TrayView: View {
         Button(
           expanded
             ? routerLocalized("Show fewer tags")
-            : (RouterLanguage.isSimplifiedChinese
-                ? "查看全部 \(family.models.count) 个标签"
-                : "View all \(family.models.count) tags")
+            : routerFormat("View all %@ tags", "\(family.models.count)")
         ) {
           withAnimation(.easeOut(duration: 0.15)) {
             if expandedLocalVariants.contains(family.id) {
@@ -7494,14 +7862,12 @@ private struct TrayView: View {
         if let runtime = localModels?.runtime {
           let runtimeLabel = runtime.installed == true
             ? "Ollama \(runtime.version ?? routerLocalized("installed"))"
-            : (RouterLanguage.isSimplifiedChinese ? "Ollama 未安装" : "Ollama not installed")
+            : (routerMessage(.ollamaMissing))
           let serverState = runtime.running == true
             ? routerLocalized("managed")
             : routerLocalized("not started")
           Text(
-            RouterLanguage.isSimplifiedChinese
-              ? "\(runtimeLabel) · 后台服务器 \(serverState)"
-              : "\(runtimeLabel) · headless server \(serverState)"
+            routerMessage(.ollamaRuntime, ["runtime": "\(runtimeLabel)", "state": "\(serverState)"])
           )
             .font(.system(size: 8))
             .foregroundStyle(runtime.installed == true ? routerMint : routerYellow)
@@ -7522,17 +7888,13 @@ private struct TrayView: View {
         }
         if let families = localModels?.families, !families.isEmpty {
           Text(
-            RouterLanguage.isSimplifiedChinese
-              ? "上方已按系列归类 \(families.count) 个 Ollama 系列的具体标签。"
-              : "\(families.count) Ollama families; exact tags are grouped above."
+            routerMessage(.ollamaFamilySummary, ["count": "\(families.count)"])
           )
             .font(.system(size: 8))
             .foregroundStyle(routerMuted)
         }
         Text(
-          RouterLanguage.isSimplifiedChinese
-            ? "安装后会使用 Ollama 的评测计数器测量速度；未测量的模型不会显示臆造的数字。"
-            : "Speed is measured after install with Ollama's eval counters; unmeasured models show no invented number."
+          routerMessage(.benchmarkExplanation)
         )
           .font(.system(size: 8))
           .foregroundStyle(routerMuted)
@@ -7677,9 +8039,7 @@ private struct TrayView: View {
             .font(.system(size: 9, weight: .medium))
             .lineLimit(1)
           Text(
-            RouterLanguage.isSimplifiedChinese
-              ? "\(routerLocalized(model.accuracy)) · \(routerLocalized(model.fit))"
-              : "\(model.accuracy) · \(model.fit)"
+            routerMessage(.modelMetadata, ["accuracy": "\(routerLocalized(model.accuracy))", "fit": "\(routerLocalized(model.fit))"])
           )
             .font(.system(size: 8))
             .foregroundStyle(model.accuracy == "accurate" ? routerMint : routerMuted)
@@ -7761,17 +8121,26 @@ private struct TrayView: View {
           }
           Text(
             isError
-              ? (isUninstalling ? "Local model removal failed" : routerLocalized("Local model install failed"))
+              ? (isUninstalling
+                ? routerLocalized("Local model removal failed")
+                : routerLocalized("Local model install failed"))
               : (isCancelled
-                ? (isUninstalling ? "Local model removal cancelled" : "Local model download cancelled")
-                : (isDone ? (isUninstalling ? "Local model removed" : routerLocalized("Local model ready"))
-                  : (isUninstalling ? "Uninstalling local model" : routerLocalized("Installing local model"))))
+                ? (isUninstalling
+                  ? routerLocalized("Local model removal cancelled")
+                  : routerLocalized("Local model download cancelled"))
+                : (isDone
+                  ? (isUninstalling
+                    ? routerLocalized("Local model removed")
+                    : routerLocalized("Local model ready"))
+                  : (isUninstalling
+                    ? routerLocalized("Uninstalling local model")
+                    : routerLocalized("Installing local model"))))
           )
             .font(.system(size: 9, weight: .semibold))
             .foregroundStyle(tint)
           Spacer(minLength: 4)
           if download.isRunning, let tag = download.tag {
-            Button("Cancel", role: .cancel) {
+            Button(routerLocalized("Cancel"), role: .cancel) {
               Task { await store.cancelLocalModel(tag) }
             }
             .buttonStyle(.borderless)
@@ -7887,16 +8256,12 @@ private struct TrayView: View {
             }
             .menuStyle(.borderlessButton)
             .buttonStyle(.borderless)
-            .accessibilityLabel(
-              RouterLanguage.isSimplifiedChinese
-                ? "\(model.tag) 的操作"
-                : "Actions for \(model.tag)"
-            )
+            .accessibilityLabel(routerFormat("Actions for %@", model.tag))
           }
           if let operation {
             HStack(spacing: 7) {
               OperationPulse(tint: routerRed)
-              Text("\(operation.kind.label)…")
+              Text("\(routerLocalized(operation.kind.label))…")
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(routerRed)
               ProgressView()
@@ -7952,7 +8317,7 @@ private struct TrayView: View {
         Text(localRoleLabel(model))
           .foregroundStyle(localRoleColor(model))
         if let accuracy = model.accuracy, model.vision {
-          Text("· \(RouterLanguage.isSimplifiedChinese ? routerLocalized(accuracy) : accuracy)")
+          Text("· \(routerLocalized(accuracy))")
             .foregroundStyle(accuracy == "accurate" ? routerMint : routerRed)
         }
         if let speed = model.tokensPerSecond {
@@ -8080,16 +8445,16 @@ private struct TrayView: View {
   private func localFamilySummary(_ family: LocalCatalogFamily) -> String {
     let fits = family.models.filter(localModelFits).count
     let cloud = family.models.filter { $0.downloadable == false }.count
-    var parts = [RouterLanguage.isSimplifiedChinese ? "\(family.models.count) 个标签" : "\(family.models.count) tags"]
+    var parts = [routerMessage(.tagCount, ["count": "\(family.models.count)"])]
     if fits > 0 {
-      parts.append(RouterLanguage.isSimplifiedChinese ? "\(fits) 个适配" : "\(fits) fit")
+      parts.append(routerMessage(.fitCount, ["count": "\(fits)"]))
     } else if cloud == family.models.count {
       parts.append(routerLocalized("cloud only"))
     } else {
       parts.append(routerLocalized("none fit"))
     }
     if cloud > 0 && cloud < family.models.count {
-      parts.append(RouterLanguage.isSimplifiedChinese ? "\(cloud) 个云端" : "\(cloud) cloud")
+      parts.append(routerMessage(.cloudCount, ["count": "\(cloud)"]))
     }
       return parts.joined(separator: " · ")
     }
@@ -8131,14 +8496,14 @@ private struct TrayView: View {
         return "\(operation.stageLabel)\(percent)"
       }
       if store.localMlx?.host?.supported == false {
-        return "MLX requires Apple silicon"
+        return routerLocalized("MLX requires Apple silicon")
       }
       if store.localMlx?.runtime?.ready == true,
         (localModels?.installed ?? 0) == 0 {
-        return "Qwen MLX ready for Codex"
+        return routerLocalized("Qwen MLX ready for Codex")
       }
       if store.localMlx?.operation.status == "error" {
-        return "MLX install failed"
+        return routerLocalized("MLX install failed")
       }
       if let download = store.localDownload, download.isRunning {
         let tag = download.tag ?? routerLocalized("local model")
@@ -8146,23 +8511,25 @@ private struct TrayView: View {
         return "\(routerLocalized(download.isUninstalling ? "Removing" : "Downloading")) \(tag)\(percent)"
       }
       if let download = store.localDownload, download.status == "error" {
-        return download.isUninstalling ? "Last removal failed" : "Last download failed"
+        return download.isUninstalling
+          ? routerLocalized("Last removal failed")
+          : routerLocalized("Last download failed")
       }
       if let download = store.localDownload, download.status == "cancelled" {
-        return download.isUninstalling ? "Removal cancelled" : "Download cancelled"
+        return download.isUninstalling
+          ? routerLocalized("Removal cancelled")
+          : routerLocalized("Download cancelled")
       }
       guard let localModels, localModels.installed > 0 else {
         let available = localModels?.availableExplore?.count ?? 0
         return available > 0
-          ? (RouterLanguage.isSimplifiedChinese ? "尚未安装 · 有 \(available) 个可用" : "none installed · \(available) available")
+          ? (routerMessage(.availableNone, ["count": "\(available)"]))
           : routerLocalized("none installed")
       }
       let chat = localModels.usableAsChat ?? 0
       let available = localModels.availableExplore?.count ?? 0
-      let suffix = available > 0 ? " · \(available) available" : ""
-      return RouterLanguage.isSimplifiedChinese
-        ? "已安装 \(localModels.installed) 个 · \(chat) 个可用于 Codex · \(String(format: "%.1f", localModels.totalGb)) GB\(suffix.replacingOccurrences(of: " available", with: " 个可用"))"
-        : "\(localModels.installed) installed · \(chat) for Codex · \(String(format: "%.1f", localModels.totalGb)) GB\(suffix)"
+      let suffix = available > 0 ? routerMessage(.availableSuffix, ["count": "\(available)"]) : ""
+      return routerMessage(.installedSummary, ["count": "\(localModels.installed)", "chat": "\(chat)", "size": "\(String(format: "%.1f", localModels.totalGb))", "suffix": "\(suffix)"])
     }
 
     private var canInstall: Bool {
@@ -8193,7 +8560,7 @@ private struct TrayView: View {
         toggleRow(
           title: routerLocalized("Read images for text-only models"),
           detail: visionEnabled
-            ? (RouterLanguage.isSimplifiedChinese ? "读取引擎：\(currentEngineLabel)" : "Reading via \(currentEngineLabel)")
+            ? (routerMessage(.readerEngine, ["engine": "\(currentEngineLabel)"]))
             : routerLocalized("Off — text-only models refuse pasted images"),
           isOn: Binding(
             get: { store.visionBridgeEnabled(authoritative: vision?.enabled == true) },
@@ -8450,17 +8817,13 @@ private struct TrayView: View {
       let mode = store.subagentModeAll(authoritative: settings?.subagents.mode == "all")
         ? "all"
         : (settings?.subagents.mode ?? "proven")
-      return RouterLanguage.isSimplifiedChinese
-        ? "\(count) 个已启用 · \(mode)"
-        : "\(count) enabled · \(mode)"
+      return routerMessage(.enabledSummary, ["count": "\(count)", "mode": "\(mode)"])
     }
 
     private var pickerSummary: String {
       let visible = enabledModels.filter { isPickerVisible($0) }.count
       let hidden = enabledModels.count - visible
-      return RouterLanguage.isSimplifiedChinese
-        ? "\(visible) 个显示 · \(hidden) 个隐藏"
-        : "\(visible) visible · \(hidden) hidden"
+      return routerMessage(.visibilitySummary, ["visible": "\(visible)", "hidden": "\(hidden)"])
     }
 
     private func toggleRow(
@@ -8500,7 +8863,7 @@ private struct TrayView: View {
       HStack {
         Spacer()
         ForEach(Array(buttons.enumerated()), id: \.offset) { _, entry in
-          Button(entry.0, action: entry.1)
+          Button(routerLocalized(entry.0), action: entry.1)
             .buttonStyle(.borderless)
             .font(.system(size: 9, weight: .medium))
             .foregroundStyle(routerMint)
@@ -9024,7 +9387,10 @@ private struct TrayView: View {
 
   private var maintenanceHint: String {
     guard let message = store.maintenanceMessage else { return "" }
-    return "\(message)\nIf this keeps failing, run ./bin/support-bundle and share the path."
+    return routerFormat(
+      "%@\nIf this keeps failing, run ./bin/support-bundle and share the path.",
+      message
+    )
   }
 
   private var emptyState: some View {
@@ -9127,7 +9493,11 @@ private struct ProviderSetupRow: View {
   @State private var removalArmed = false
   @State private var armGeneration = 0
 
-  private var credentialLabel: String { setup?.credentialLabel ?? routerLocalized("API key") }
+  // The router spells the label ("API key", "OAuth client secret"); translate
+  // the ones this app knows so the composed buttons below read in Chinese.
+  private var credentialLabel: String {
+    routerLocalized(setup?.credentialLabel ?? "API key")
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 9) {
@@ -9169,16 +9539,14 @@ private struct ProviderSetupRow: View {
         VStack(alignment: .leading, spacing: 5) {
           Text(
             setup?.configured == true
-              ? (RouterLanguage.isSimplifiedChinese ? "替换\(credentialLabel)" : "Replacement \(credentialLabel)")
+              ? (routerMessage(.credentialReplacement, ["credential": "\(credentialLabel)"]))
               : credentialLabel
           )
             .font(.system(size: 9, weight: .medium))
             .foregroundStyle(routerMuted)
           HStack(spacing: 7) {
             SecureField(
-              RouterLanguage.isSimplifiedChinese
-                ? "粘贴\(credentialLabel)"
-                : "Paste \(credentialLabel.lowercased())",
+              routerMessage(.credentialPaste, ["credential": "\(credentialLabel.lowercased())"]),
               text: $apiKey
             )
               .textFieldStyle(.plain)
@@ -9224,7 +9592,7 @@ private struct ProviderSetupRow: View {
     }
     if setup.configured {
       let visibility = provider.enabled ? routerLocalized("Available in Codex") : routerLocalized("Hidden from Codex")
-      return RouterLanguage.isSimplifiedChinese ? "就绪 · \(visibility)" : "Ready · \(visibility)"
+      return routerMessage(.readyVisibility, ["visibility": "\(visibility)"])
     }
     switch setup.action {
     case "install": return routerLocalized("Official CLI required")
@@ -9234,6 +9602,9 @@ private struct ProviderSetupRow: View {
         : routerLocalized("Sign in with the official CLI")
     case "add-key":
       return "\(credentialLabel) \(routerLocalized("required"))"
+    case "configure":
+      return setup.configurationNote
+        ?? routerLocalized("Run the provider's local configuration command, then refresh")
     case "probe": return routerLocalized("Live test required · sends a small prompt and uses quota")
     case "blocked":
       return setup.blockedNote
@@ -9304,7 +9675,7 @@ private struct ProviderSetupRow: View {
           .help(
             showingKeyField
               ? routerLocalized("Cancel credential replacement")
-              : (RouterLanguage.isSimplifiedChinese ? "替换\(credentialLabel)" : "Replace \(credentialLabel)")
+              : (routerMessage(.credentialReplace, ["credential": "\(credentialLabel)"]))
           )
           .disabled(controlsDisabled)
 
@@ -9320,7 +9691,7 @@ private struct ProviderSetupRow: View {
           .help(
             removalArmed
               ? routerLocalized("Click again to delete the stored credential")
-              : (RouterLanguage.isSimplifiedChinese ? "移除已保存的\(credentialLabel)" : "Remove stored \(credentialLabel)")
+              : (routerMessage(.credentialRemove, ["credential": "\(credentialLabel)"]))
           )
           .disabled(controlsDisabled)
         }
@@ -9332,7 +9703,7 @@ private struct ProviderSetupRow: View {
       }
     } else {
       HStack(spacing: 10) {
-        if setup?.action != "blocked" {
+        if setup?.action != "blocked" && setup?.action != "configure" {
           Button(actionTitle) { performAction() }
             .buttonStyle(.plain)
             .font(.system(size: 10, weight: .medium))
@@ -9366,7 +9737,7 @@ private struct ProviderSetupRow: View {
       guard !showingKeyField else { return routerLocalized("Cancel") }
       return credentialLabel == routerLocalized("API key")
         ? routerLocalized("Add Key")
-        : (RouterLanguage.isSimplifiedChinese ? "添加\(credentialLabel)" : "Add \(credentialLabel)")
+        : (routerMessage(.credentialAdd, ["credential": "\(credentialLabel)"]))
     case "probe": return routerLocalized("Test & Enable")
     default: return routerLocalized("Checking…")
     }
@@ -9484,7 +9855,7 @@ private struct ProviderUsageSection: View {
         Spacer()
         if store.selectedUsageUsesChatGPT,
            let streak = store.accountUsage?.summary.currentStreakDays {
-          Text(RouterLanguage.isSimplifiedChinese ? "连续 \(streak) 天" : "\(streak)-day streak")
+          Text(routerMessage(.streakDays, ["count": "\(streak)"]))
         }
       }
       .font(.system(size: 9))
@@ -9530,7 +9901,7 @@ private struct ProviderUsageSection: View {
   private var primaryMetric: String {
     if store.selectedUsageUsesChatGPT {
       guard let value = store.accountUsage?.primary?.remainingPercent else { return "—" }
-      return RouterLanguage.isSimplifiedChinese ? "剩余 \(value)%" : "\(value)% left"
+      return routerMessage(.remainingPercent, ["count": "\(value)"])
     }
     guard store.providerUsage != nil else { return "—" }
     if let metric = store.selectedAccountMetric { return formattedAccountMetric(metric) }
@@ -9554,9 +9925,7 @@ private struct ProviderUsageSection: View {
         if let detail = metric.detail, !detail.isEmpty { return detail }
         return standardizedLimitLabel(metric.label)
       }
-      return RouterLanguage.isSimplifiedChinese
-        ? "\(usage.credentialType.uppercased()) 流量 · \(routerLocalized("measured on this Mac"))"
-        : "\(usage.credentialType.uppercased()) traffic · measured on this Mac"
+      return routerMessage(.providerTraffic, ["provider": "\(usage.credentialType.uppercased())"])
     }
     return routerLocalized("Loading native Codex usage…")
   }
@@ -9566,13 +9935,9 @@ private struct ProviderUsageSection: View {
     let formattedTotal = self.tokenDisplayUnit.format(total)
     if !store.selectedUsageUsesChatGPT {
       let requests = store.localUsageTotals(days: range.rawValue).requests
-      return RouterLanguage.isSimplifiedChinese
-        ? "\(formattedTotal) token · \(requests) 个请求 · 近 \(range.rawValue) 天"
-        : "\(formattedTotal) tokens · \(requests) requests over \(range.rawValue) days"
+      return routerMessage(.periodRequests, ["tokens": "\(formattedTotal)", "requests": "\(requests)", "days": "\(range.rawValue)"])
     }
-    let caption = RouterLanguage.isSimplifiedChinese
-      ? "\(formattedTotal) token · 近 \(range.rawValue) 天"
-      : "\(formattedTotal) tokens over \(range.rawValue) days"
+    let caption = routerMessage(.periodTokens, ["tokens": "\(formattedTotal)", "days": "\(range.rawValue)"])
     guard fallbackDays > 0 else { return caption }
     let suffix = fallbackDays == 1
       ? routerLocalized("1 local fallback date")
@@ -9631,14 +9996,27 @@ private struct SavingsSparkBars: View {
           .font(.system(size: 7.5))
           .foregroundStyle(routerMuted)
         Spacer()
-        Text("peak \(ToolResultAgingStats.compactCount(peak))/\(bucketUnit)")
+        Text(
+          routerFormat(
+            "peak %@/%@",
+            ToolResultAgingStats.compactCount(peak),
+            bucketUnit
+          )
+        )
           .font(.system(size: 7.5))
           .foregroundStyle(routerMuted)
           .monospacedDigit()
       }
     }
     .accessibilityElement(children: .ignore)
-    .accessibilityLabel("\(caption), peak \(peak) per \(bucketUnit == "h" ? "hour" : "day")")
+    .accessibilityLabel(
+      routerFormat(
+        "%@, peak %d per %@",
+        caption,
+        peak,
+        routerLocalized(bucketUnit == "h" ? "hour" : "day")
+      )
+    )
   }
 }
 
@@ -9682,9 +10060,7 @@ private struct CurrentUsageLimitCard: View {
   private var metricText: String {
     if let metric = card.metric { return formattedAccountMetric(metric) }
     guard let remaining = card.remainingPercent else { return "—" }
-    return RouterLanguage.isSimplifiedChinese
-      ? "剩余 \(Int(remaining.rounded()))%"
-      : "\(Int(remaining.rounded()))% left"
+    return routerMessage(.remainingPercent, ["count": "\(Int(remaining.rounded()))"])
   }
 
   private var resetText: String {
@@ -9752,9 +10128,7 @@ private struct ModelUsageBreakdown: View {
 
       if hiddenCount > 0 {
         Text(
-          RouterLanguage.isSimplifiedChinese
-            ? "还有 \(hiddenCount) 个模型"
-            : "+\(hiddenCount) more model\(hiddenCount == 1 ? "" : "s")"
+          routerMessage(hiddenCount == 1 ? .moreModelsOne : .moreModels, ["count": "\(hiddenCount)"])
         )
           .font(.system(size: 8.5))
           .foregroundStyle(routerMuted)
@@ -9769,26 +10143,20 @@ private struct ModelUsageBreakdown: View {
 
   private func primaryLabel(for row: ModelUsageRow) -> String {
     guard row.model.totalTokens > 0 else {
-      return RouterLanguage.isSimplifiedChinese ? "\(row.model.requests) 个请求" : "\(row.model.requests) req"
+      return routerMessage(.requestsShort, ["count": "\(row.model.requests)"])
     }
-    return RouterLanguage.isSimplifiedChinese
-      ? "\(compactTokenCount(Double(row.model.totalTokens))) token"
-      : "\(compactTokenCount(Double(row.model.totalTokens))) tok"
+    return routerMessage(.tokenCountCompact, ["tokens": "\(compactTokenCount(Double(row.model.totalTokens)))"])
   }
 
   private func detailLabel(for row: ModelUsageRow) -> String {
     // A model with traffic but no metered response carries no token counts;
     // say so rather than implying it burned nothing.
     guard row.model.totalTokens > 0 else {
-      return RouterLanguage.isSimplifiedChinese
-        ? "\(row.model.requests) 个请求 · 未计量"
-        : "\(row.model.requests) req · not metered"
+      return routerMessage(.requestsUnmetered, ["count": "\(row.model.requests)"])
     }
     let input = compactTokenCount(Double(row.model.inputTokens))
     let output = compactTokenCount(Double(row.model.outputTokens))
-    return RouterLanguage.isSimplifiedChinese
-      ? "输入 \(input) · 输出 \(output) · \(row.model.requests) 个请求"
-      : "\(input) in · \(output) out · \(row.model.requests) req"
+    return routerMessage(.inputOutputRequests, ["input": "\(input)", "output": "\(output)", "requests": "\(row.model.requests)"])
   }
 }
 
@@ -9867,14 +10235,10 @@ private struct AllProviderUsageCard: View {
     }
     .buttonStyle(.plain)
     .help(
-      RouterLanguage.isSimplifiedChinese
-        ? "显示 \(card.provider.displayName) 用量"
-        : "Show \(card.provider.displayName) usage"
+      routerMessage(.providerUsage, ["provider": "\(card.provider.displayName)"])
     )
     .accessibilityLabel(
-      RouterLanguage.isSimplifiedChinese
-        ? "显示 \(card.provider.displayName) 用量"
-        : "Show \(card.provider.displayName) usage"
+      routerMessage(.providerUsage, ["provider": "\(card.provider.displayName)"])
     )
   }
 
@@ -9895,9 +10259,7 @@ private struct AllProviderUsageCard: View {
     if oauthNeedsReconnect { return routerLocalized("Reconnect") }
     if let metric = card.metric { return formattedAccountMetric(metric) }
     if let remaining = card.remainingPercent {
-      return RouterLanguage.isSimplifiedChinese
-        ? "剩余 \(Int(remaining.rounded()))%"
-        : "\(Int(remaining.rounded()))% left"
+      return routerMessage(.remainingPercent, ["count": "\(Int(remaining.rounded()))"])
     }
     if card.providerID == "openai" { return "—" }
     return store.localUsageSummary(for: card.providerID, days: 7)
@@ -9909,18 +10271,16 @@ private struct AllProviderUsageCard: View {
       return kindLabel
     }
     if card.providerID == "openai" {
-      return store.accountUsage?.primary?.durationLabel ?? "Weekly limit"
+      return store.accountUsage?.primary?.durationLabel ?? routerLocalized("Weekly limit")
     }
     if localTotals.requests > 0 || localTotals.tokens > 0 {
       if localTotals.tokens > 0, localTotals.requests > 0 {
-        return RouterLanguage.isSimplifiedChinese
-          ? "近 7 天本地 · \(localTotals.requests) 个请求"
-          : "7D local · \(localTotals.requests) requests"
+        return routerMessage(.recentLocalRequests, ["count": "\(localTotals.requests)"])
       }
       if localTotals.requests > 0 {
-        return RouterLanguage.isSimplifiedChinese ? "近 7 天本地 · 未报告 token" : "7D local · tokens not reported"
+        return routerMessage(.recentLocalUnreported)
       }
-      return RouterLanguage.isSimplifiedChinese ? "近 7 天本地流量" : "7D local traffic"
+      return routerMessage(.recentLocalTraffic)
     }
     if card.provider.isEnabled { return routerLocalized("No router traffic yet") }
     return routerLocalized("Configured · currently hidden")
@@ -10104,15 +10464,15 @@ struct UsageBarChart: View {
 
   private func axisLabel(for point: DailyUsagePoint) -> String {
     if points.count <= 7 {
-      return point.date.formatted(.dateTime.weekday(.abbreviated))
+      return point.date.usageDayLabel(.dateTime.weekday(.abbreviated))
     }
-    return point.date.formatted(.dateTime.month(.defaultDigits).day())
+    return point.date.usageDayLabel(.dateTime.month(.defaultDigits).day())
   }
 
   private func hoverText(for point: DailyUsagePoint) -> String {
-    let date = point.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+    let date = point.date.usageDayLabel(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
     let tokens = self.tokenDisplayUnit.format(point.tokens)
-    let text = RouterLanguage.isSimplifiedChinese ? "\(date) · \(tokens) token" : "\(date) · \(tokens) tokens"
+    let text = routerMessage(.dateTokens, ["date": "\(date)", "tokens": "\(tokens)"])
     guard point.isRouterFallback else { return text }
     return "\(text) · \(routerLocalized("local fallback"))"
   }
@@ -10192,28 +10552,24 @@ func usageResetCaption(_ date: Date) -> String {
 
 // How long until a quota window reopens -- the number people actually scan
 // the reset list for. The absolute clock time is resetClockLabel's job.
-// `chinese` is a parameter (not read inline) so tests stay deterministic while
-// the Tray language suite mutates the process-wide selection in parallel.
+// Explicit language makes tests deterministic while other suites change the
+// process preference. The optional Bool preserves existing caller compatibility.
 func resetCountdownLabel(
   _ date: Date,
   now: Date = Date(),
-  chinese: Bool = RouterLanguage.isSimplifiedChinese
+  chinese: Bool? = nil,
+  language: ResolvedTrayLanguage = RouterLanguage.resolution
 ) -> String {
+  let resolved = chinese.map { $0 ? ResolvedTrayLanguage.chinese : .english } ?? language
   let seconds = date.timeIntervalSince(now)
-  if seconds <= 0 { return chinese ? "即将重置" : "resets soon" }
+  if seconds <= 0 { return routerMessage(.resetSoon, language: resolved) }
   let minutes = Int(seconds / 60)
-  if minutes < 60 {
-    return chinese ? "\(minutes) 分钟后" : "in \(minutes)m"
-  }
+  if minutes < 60 { return routerMessage(.resetMinutes, ["minutes": "\(minutes)"], language: resolved) }
   let hours = minutes / 60
   if hours < 24 {
-    return chinese
-      ? "\(hours) 小时 \(minutes % 60) 分后"
-      : "in \(hours)h \(minutes % 60)m"
+    return routerMessage(.resetHours, ["hours": "\(hours)", "minutes": "\(minutes % 60)"], language: resolved)
   }
-  return chinese
-    ? "\(hours / 24) 天 \(hours % 24) 小时后"
-    : "in \(hours / 24)d \(hours % 24)h"
+  return routerMessage(.resetDays, ["days": "\(hours / 24)", "hours": "\(hours % 24)"], language: resolved)
 }
 
 // Just enough calendar context for the countdown: time today, weekday inside

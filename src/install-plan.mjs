@@ -237,6 +237,8 @@ function controlCenterSources(root) {
     ]),
     path.join(base, "assets", "icon.png"),
     path.join(base, "assets", "icon.ico"),
+    path.join(base, "assets", "trayTemplate.png"),
+    path.join(base, "assets", "trayTemplate@2x.png"),
   ];
 }
 
@@ -254,6 +256,7 @@ const TRAY_PLATFORMS = {
       return [
         path.join(root, "scripts", "build-macos-tray-app.sh"),
         path.join(root, "scripts", "build-macos-widget.sh"),
+        path.join(root, "src", "macos-developer-tools.mjs"),
         path.join(base, "Package.swift"),
         path.join(base, "Resources", "Info.plist"),
         path.join(base, "Resources", "ModelRouterTray.entitlements"),

@@ -5,6 +5,41 @@ import { HeaderlessSseDetector } from "./sse-prefix.mjs";
 
 const MAX_PRECONTENT_BYTES = 1024 * 1024;
 const MAX_PRECONTENT_MS = 30_000;
+// An individual event can echo tool schemas or carry a large reasoning delta.
+// Bound its unfinished frame separately from the accumulated prelude hold.
+const MAX_INCOMPLETE_EVENT_BYTES = 10 * 1024 * 1024;
+
+// The pre-content budget has to cover the prefill, and the prefill scales with
+// the prompt. A 577k-token request legitimately spends 70-130s before the first
+// content byte, and a flat budget reads that as an empty completion: measured
+// 2026-09-21, a routed client whose context had grown to ~577k tokens was
+// answered with explicit `precontent_limit` 502s while the same requests
+// succeeded whenever the prefill happened to fit the budget.
+//
+// Scale the budget with the request size so small turns keep failing fast while
+// large ones get the time their prefill needs. Tokens are estimated at the
+// usual four bytes per token; the allowance only ever grows, and never past
+// `maxMs` (unless the configured base is already larger, which is the
+// operator's explicit choice).
+export const PRELUDE_MS_PER_THOUSAND_TOKENS = 150;
+export const PRELUDE_BUDGET_MAX_MS = 600_000;
+
+export function preludeBudgetMs({
+  baseMs,
+  requestBytes = 0,
+  perThousandTokensMs = PRELUDE_MS_PER_THOUSAND_TOKENS,
+  maxMs = PRELUDE_BUDGET_MAX_MS,
+} = {}) {
+  const base = Number.isFinite(baseMs) && baseMs >= 0 ? baseMs : 0;
+  const bytes = Number.isFinite(requestBytes) && requestBytes > 0 ? requestBytes : 0;
+  const rate =
+    Number.isFinite(perThousandTokensMs) && perThousandTokensMs >= 0
+      ? perThousandTokensMs
+      : PRELUDE_MS_PER_THOUSAND_TOKENS;
+  const scaled = base + (bytes / 4 / 1000) * rate;
+  const ceiling = Math.max(Number.isFinite(maxMs) && maxMs > 0 ? maxMs : PRELUDE_BUDGET_MAX_MS, base);
+  return Math.max(base, Math.min(ceiling, Math.round(scaled)));
+}
 
 export class EmptyCompletionPreludeLimitError extends Error {
   constructor(kind) {
@@ -38,6 +73,20 @@ function isTerminalEvent(eventType, dataText) {
     eventType === "response.completed" ||
     eventType === "response.done"
   );
+}
+
+const FAILURE_TERMINAL_EVENT_TYPES = new Set(["error", "response.failed", "response.incomplete"]);
+
+// An upstream that states the turn failed: a typed failure event, or an
+// untyped `data:` payload whose JSON names one.
+function isFailureTerminalEvent(eventType, dataText) {
+  if (FAILURE_TERMINAL_EVENT_TYPES.has(eventType)) return true;
+  if (eventType !== undefined || !dataText || dataText === "[DONE]") return false;
+  try {
+    return FAILURE_TERMINAL_EVENT_TYPES.has(JSON.parse(dataText)?.type);
+  } catch {
+    return false;
+  }
 }
 
 function sseFields(block) {
@@ -209,6 +258,18 @@ export class EmptyCompletionTerminalGuard extends Transform {
 
 function partHasContent(part) {
   if (!part || typeof part !== "object") return false;
+  // LiteLLM's Chat Completions -> Responses bridge can close the assistant
+  // message with `type: "reasoning_text"` (and a `reasoning` field) instead of
+  // `output_text`. That is thinking, not an answer: counting it as content
+  // would hide an empty completion, and counting it as liveness would disable
+  // the silent retry that recovers the next attempt's text.
+  if (
+    part.type === "reasoning_text" ||
+    part.type === "reasoning" ||
+    part.type === "thinking"
+  ) {
+    return false;
+  }
   return (
     (typeof part.text === "string" && part.text.length > 0) ||
     (typeof part.refusal === "string" && part.refusal.length > 0)
@@ -474,12 +535,15 @@ export class EmptyCompletionGuard extends Transform {
       // A liveness or time-limit release ends the hold, not the question. Keep
       // parsing from behind the relay so a turn that later produces nothing is
       // still recognized — it just gets reported instead of retried.
+      // After release, use a much higher limit for incomplete SSE blocks to allow
+      // legitimate large reasoning deltas (issue #684) while still protecting
+      // against unbounded/malformed streams.
       if (!this.#settled()) {
         this.#parseBuffer += this.#decoder.write(bytes);
         this.#consumeBlocks();
         if (
           !this.#settled() &&
-          Buffer.byteLength(this.#parseBuffer) > this.#maxPreludeBytes
+          Buffer.byteLength(this.#parseBuffer) > MAX_INCOMPLETE_EVENT_BYTES
         ) {
           this.#failPrelude("bytes");
         }
@@ -492,15 +556,27 @@ export class EmptyCompletionGuard extends Transform {
     this.#parseBuffer += this.#decoder.write(bytes);
     this.#consumeBlocks();
     if (!this.#released && this.#bufferedBytes > this.#maxPreludeBytes) {
+      const pendingBytes = Buffer.byteLength(this.#parseBuffer);
+      // Let a fragmented first event finish before classifying it. Retain at
+      // most one bounded unfinished frame beyond the prelude budget; completed
+      // malformed blocks cannot accumulate behind a small unfinished tail.
+      if (
+        !this.#sawTerminal &&
+        pendingBytes > 0 &&
+        pendingBytes <= MAX_INCOMPLETE_EVENT_BYTES &&
+        this.#bufferedBytes - pendingBytes <= this.#maxPreludeBytes
+      ) {
+        return;
+      }
       // A large but well-framed prologue is not a broken stream. Providers can
       // echo substantial response metadata before the first delta; relaying a
       // completed JSON event bounds our staging memory while parsing behind
-      // the relay preserves the eventual empty/content verdict. An unframed or
-      // unparseable body still fails closed at the same byte limit.
+      // the relay preserves the eventual empty/content verdict. Oversized
+      // unfinished frames and unparseable completed bodies still fail closed.
       if (
         this.#sawParseableEvent &&
         !this.#sawTerminal &&
-        Buffer.byteLength(this.#parseBuffer) <= this.#maxPreludeBytes
+        pendingBytes <= MAX_INCOMPLETE_EVENT_BYTES
       ) {
         this.#release({ preludeLimit: "bytes" });
       } else {
@@ -607,6 +683,18 @@ export class EmptyCompletionGuard extends Transform {
       this.#sawContent = true;
       this.#clearTimer();
       this.#release();
+      return;
+    }
+    // A failure terminal is the upstream's own verdict, not an empty
+    // completion. Holding it would only delay the error the client needs
+    // (until the prelude or stall timer, which then reports a second failure),
+    // and retrying it would replay a request the provider already refused.
+    if (isFailureTerminalEvent(eventType, dataText)) {
+      this.#clearTimer();
+      this.#release();
+      // A stream already released for liveness or a time limit stops parsing
+      // and stops its stall timer too: the failure is the verdict.
+      this.#keepParsingAfterRelease = false;
       return;
     }
     if (isTerminalEvent(eventType, dataText)) {

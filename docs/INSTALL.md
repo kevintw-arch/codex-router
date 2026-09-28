@@ -82,13 +82,21 @@ Windows the matching options are `-WithTray` and `-NoTray`.
 
 On macOS one `Codex Router.app` bundle is placed in `~/Applications`. It keeps
 the Swift-native menu-bar tray and embeds the Electron Control Center, so the
-build needs the Swift toolchain plus the Node runtime the router already
-requires; a missing toolchain skips the step with guidance instead of failing
-setup. Opening the app shows the Control Center, while a supervised login start
-keeps only the native tray visible. On Windows the packaged Electron Control
-Center owns both the native tray and the full window and is registered as the
-single `Codex Router Tray` logon task. Linux uses the same packaged Control
-Center and native Electron tray. Neither platform requires Rust.
+build needs the full Xcode app plus the Node runtime the router already
+requires. The standalone Command Line Tools are insufficient for the SwiftUI
+macro plug-ins used by recent macOS SDKs and do not provide the `xcodebuild`
+needed by the WidgetKit extension. The build honors `DEVELOPER_DIR` and the
+Xcode selected under **Xcode → Settings → Locations → Command Line Tools**. If
+that selection names the standalone tools, a standard
+`/Applications/Xcode.app` or `/Applications/Xcode-beta.app` is used for this
+build only; nonstandard installations can be selected with `DEVELOPER_DIR`.
+A missing full Xcode installation skips the companion with guidance instead of
+failing the already-installed router. Opening the app shows the Control Center,
+while a supervised login start keeps only the native tray visible. On Windows
+the packaged Electron Control Center owns both the native tray and the full
+window and is registered as the single `Codex Router Tray` logon task. Linux
+uses the same packaged Control Center and native Electron tray. Neither
+platform requires Rust.
 Guided setup walks through numbered steps: a provider list you toggle by
 number (`a` selects all, `n` clears, Enter continues) with a live
 ready/needs-key/needs-sign-in status per provider, credential onboarding for
@@ -537,7 +545,11 @@ value — the update is kept, because none of those say anything about the code
 that was just fetched, and discarding it means the next attempt repeats the
 same failure with the same code. Rolling back there is what made a setup-path
 bug impossible to fix by updating: the fix was fetched and then thrown away.
-Any other non-zero exit still restores the previous revision. Re-run setup to
+Any other non-zero exit still restores the previous revision, leaving HEAD
+detached at that commit so the running service keeps the last known-good
+tree. The next `install.sh` / `install.ps1` run, or `./bin/update`, switches
+back to `main` before fetching; a named non-`main` branch is still refused.
+Re-run setup to
 continue, or `./bin/rollback` (`./codex-router.ps1 rollback` on Windows) to
 return to the retained revision deliberately.
 

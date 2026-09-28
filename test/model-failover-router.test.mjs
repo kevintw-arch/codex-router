@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { userModelEntry } from "../src/user-models.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -199,6 +200,7 @@ function run(
     userModels,
     genericProviders,
     v2Credentials = false,
+    hiddenModels,
   } = {},
 ) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-failover-router-state-"));
@@ -265,6 +267,13 @@ function run(
       encoding: "utf8",
       mode: 0o600,
     });
+  }
+  if (Array.isArray(hiddenModels)) {
+    writeFileSync(
+      path.join(stateDir, "model-picker.json"),
+      JSON.stringify({ version: 1, hidden: hiddenModels, visible: [], seeded: hiddenModels }),
+      "utf8",
+    );
   }
   if (v2Credentials) {
     for (const [file, key] of [
@@ -492,6 +501,7 @@ test("a marked provider transport failure moves a subagent to a checked-in v2 ro
 
     assert.deepEqual(seen.map((body) => body.model), [
       V2_PRIMARY.gatewayModel,
+      V2_PRIMARY.gatewayModel,
       V2_FALLBACK.gatewayModel,
     ]);
     assert.equal(result.status, 200);
@@ -528,9 +538,210 @@ test("subagent transport failover preserves search history execution mode", asyn
       { headers: { "x-openai-subagent": "review-child" } },
     );
 
-    assert.deepEqual(seen.map((body) => body.model), [V2_THIRD.gatewayModel]);
+    assert.deepEqual(seen.map((body) => body.model), [
+      V2_THIRD.gatewayModel,
+      V2_THIRD.gatewayModel,
+    ]);
     assert.equal(result.status, 502);
     assert.match(child.testErrors(), /reason=transport -> none outcome=no-candidate/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a marked provider transport failure retries the same ordinary route once", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body);
+    if (seen.length === 1) {
+      response.writeHead(502, { "Content-Type": "application/json" });
+      response.end(TRANSPORT_BODY);
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("same-route-transport-retry"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [V2_FALLBACK.slug],
+    v2Credentials: true,
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: V2_PRIMARY.slug });
+
+    assert.deepEqual(seen.map((body) => body.model), [
+      V2_PRIMARY.gatewayModel,
+      V2_PRIMARY.gatewayModel,
+    ]);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /answered-by-same-route-transport-retry/);
+    assert.match(child.testErrors(), /routed transport retry 1\/1/);
+    const [event] = await waitForUsageEvents(child.stateDir, 1, child);
+    assert.equal(event.model, V2_PRIMARY.slug);
+    assert.equal(event.status, 200);
+    assert.equal(event.retries, 1);
+    // The retry is a second upstream attempt and must be observed as one.
+    const activity = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/activity`).then((r) => r.json());
+    const settled = activity.recent.find((entry) => entry.requestId === event.requestId);
+    assert.ok(settled, `no settled activity for ${event.requestId}: ${JSON.stringify(activity)}`);
+    assert.equal(settled.upstreamAttempts, 2);
+    assert.equal(settled.state, "completed");
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+function quotaResponse(response) {
+  const payload = Buffer.from(QUOTA_BODY, "utf8");
+  response.writeHead(429, {
+    "Content-Type": "application/json",
+    "Content-Length": String(payload.length),
+  });
+  response.end(payload);
+}
+
+test("a Fast Grok turn never reaches a failover candidate at priority, and activity names the candidate", async () => {
+  const seen = [];
+  let releaseCandidate = () => {};
+  const candidateHeld = new Promise((resolve) => {
+    releaseCandidate = resolve;
+  });
+  let candidateArrived;
+  const arrived = new Promise((resolve) => {
+    candidateArrived = resolve;
+  });
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    if (seen.length === 1) {
+      quotaResponse(response);
+      return;
+    }
+    candidateArrived();
+    await candidateHeld;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("fallback"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const pending = readRouted(routerPort, {
+      ...TURN_BODY,
+      model: "grok-oauth/grok-4.6",
+      service_tier: "priority",
+    });
+    await arrived;
+    // The candidate is holding its headers: activity must credit that wait
+    // to the candidate, not to the provider that already failed.
+    const activity = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/activity`).then((r) => r.json());
+    assert.equal(activity.active.length, 1, JSON.stringify(activity));
+    assert.equal(activity.active[0].model, FALLBACK.slug);
+    assert.equal(activity.active[0].phase, "awaiting_upstream");
+    assert.equal(activity.active[0].upstreamAttempts, 2);
+    releaseCandidate();
+    const result = await pending;
+    assert.equal(result.status, 200, result.body);
+    assert.match(result.body, /answered-by-fallback/);
+    assert.equal(seen.length, 2);
+    // Grok 4.6 advertises priority, so its own body keeps the tier (and the
+    // extra_body copy the locked gateway needs).
+    assert.equal(seen[0].service_tier, "priority");
+    assert.equal(seen[0].extra_body?.service_tier, "priority");
+    assert.equal(seen[1].model, FALLBACK.gatewayModel);
+    assert.equal("service_tier" in seen[1], false, JSON.stringify(seen[1]));
+    assert.equal(seen[1].extra_body?.service_tier, undefined);
+  } finally {
+    releaseCandidate();
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a curated route that advertises a service tier still receives it", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("curated-tier"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    userModels: [{
+      ...GROQ_CANDIDATE,
+      serviceTiers: [{ id: "priority", name: "Fast", description: "Fixture priority tier." }],
+    }],
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const advertised = await readRouted(routerPort, {
+      ...TURN_BODY,
+      model: GROQ_CANDIDATE.slug,
+      service_tier: "priority",
+    });
+    assert.equal(advertised.status, 200, advertised.body);
+    const unadvertised = await readRouted(routerPort, {
+      ...TURN_BODY,
+      model: GROQ_CANDIDATE.slug,
+      service_tier: "flex",
+    });
+    assert.equal(unadvertised.status, 200, unadvertised.body);
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].service_tier, "priority");
+    assert.equal(seen[0].extra_body?.service_tier, undefined, "only Grok 4.6 needs the extra_body copy");
+    assert.equal("service_tier" in seen[1], false, JSON.stringify(seen[1]));
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a failover chain that finds no taker reports the model that failed", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    quotaResponse(response);
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(seen.length, 2, "the candidate was tried");
+    assert.notEqual(result.status, 200);
+    const [event] = await waitForUsageEvents(child.stateDir, 1, child);
+    const activity = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/activity`).then((r) => r.json());
+    const settled = activity.recent.find((entry) => entry.requestId === event.requestId);
+    assert.ok(settled, JSON.stringify(activity));
+    assert.equal(settled.model, PRIMARY.slug);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("an unmarked provider 502 is never retried", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    response.writeHead(502, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "provider unavailable" } }));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [V2_FALLBACK.slug],
+    v2Credentials: true,
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: V2_PRIMARY.slug });
+
+    assert.deepEqual(seen.map((body) => body.model), [V2_PRIMARY.gatewayModel]);
+    assert.equal(result.status, 502);
+    assert.doesNotMatch(child.testErrors(), /routed transport retry/);
   } finally {
     await stopChild(child);
     await closeServer(gw.server);
@@ -553,7 +764,10 @@ test("a marked provider transport failure does not move an ordinary turn", async
     await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
     const result = await readRouted(routerPort, { ...TURN_BODY, model: V2_PRIMARY.slug });
 
-    assert.deepEqual(seen.map((body) => body.model), [V2_PRIMARY.gatewayModel]);
+    assert.deepEqual(seen.map((body) => body.model), [
+      V2_PRIMARY.gatewayModel,
+      V2_PRIMARY.gatewayModel,
+    ]);
     assert.equal(result.status, 502);
     assert.match(child.testErrors(), /reason=transport -> none outcome=no-candidate/);
   } finally {
@@ -582,7 +796,10 @@ test("a subagent header cannot grant fallback authority to an unverified route",
       { headers: { "x-openai-subagent": "caller-claimed-child" } },
     );
 
-    assert.deepEqual(seen.map((body) => body.model), [PRIMARY.gatewayModel]);
+    assert.deepEqual(seen.map((body) => body.model), [
+      PRIMARY.gatewayModel,
+      PRIMARY.gatewayModel,
+    ]);
     assert.equal(result.status, 502);
     assert.match(child.testErrors(), /reason=transport -> none outcome=no-candidate/);
   } finally {
@@ -623,6 +840,7 @@ test("subagent transport failover stops on the first application response", asyn
     );
 
     assert.deepEqual(seen.map((body) => body.model), [
+      V2_PRIMARY.gatewayModel,
       V2_PRIMARY.gatewayModel,
       V2_FALLBACK.gatewayModel,
     ]);
@@ -1272,8 +1490,7 @@ test("a responses turn failing over to a chat-completions provider flattens it",
 // A fallback that answers with a flattened tool call. The response transform has
 // to map it back to the client's namespace shape using the *fallback's* map and
 // slug -- the ones adopted during the swap, not the exhausted model's.
-function toolCallSse(name) {
-  const args = JSON.stringify({ task: "audit the map" });
+function toolCallSse(name, args = JSON.stringify({ task: "audit the map" })) {
   const events = [
     { type: "response.created", response: { id: "r-tool" } },
     {
@@ -1718,6 +1935,421 @@ test("a rate limit with no usable window asks for patience", async () => {
       assert.doesNotMatch(message, /Retry in about 0s/);
     }
   } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+const LOCAL_CONVERSION_BODY = JSON.stringify({
+  error: {
+    message:
+      "Failed to parse tool call arguments for tool 'exec_command' (Anthropic tool invoke). " +
+      "Error: Unterminated string starting at: line 1 column 8 (char 7).\n" +
+      '{"cmd":"usage limit reached for your GLM Coding Plan. Upgrade your plan."}',
+  },
+});
+
+test("a local tool-argument conversion 400 is not attributed to the provider and does not failover", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body);
+    const payload = Buffer.from(LOCAL_CONVERSION_BODY, "utf8");
+    response.writeHead(400, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].model, PRIMARY.gatewayModel);
+    assert.equal(result.status, 400);
+    const payload = JSON.parse(result.body);
+    assert.equal(payload.error.code, "invalid_function_call_arguments");
+    assert.match(payload.error.message, /not a provider rejection/);
+    assert.doesNotMatch(payload.error.message, /rejected the request/);
+    assert.doesNotMatch(payload.error.message, /usage limit reached/);
+    assert.doesNotMatch(child.testErrors(), /failover/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a stored function_call with unterminated JSON is refused before any provider request", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("should-not-run"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, {
+      model: PRIMARY.slug,
+      stream: true,
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+        {
+          type: "function_call",
+          name: "exec_command",
+          call_id: "call_poisoned",
+          arguments: '{"cmd":"echo hello',
+        },
+      ],
+    });
+    assert.equal(seen.length, 0, "the poisoned history must never reach the gateway");
+    assert.equal(result.status, 400);
+    const payload = JSON.parse(result.body);
+    assert.equal(payload.error.code, "invalid_function_call_arguments");
+    assert.match(payload.error.message, /exec_command/);
+    assert.match(payload.error.message, /call_poisoned/);
+    assert.match(payload.error.message, /not a provider rejection/);
+    assert.doesNotMatch(payload.error.message, /echo hello/);
+    assert.doesNotMatch(child.testErrors(), /failover/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a streamed function_call with unterminated JSON is failed and the completing snapshot is withheld", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(toolCallSse("exec_command", '{"cmd":"echo hello'));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(seen.length, 2, "invalid arguments retry once, then fail locally, never failover");
+    assert.equal(seen[0].model, PRIMARY.gatewayModel);
+    assert.equal(seen[1].model, PRIMARY.gatewayModel);
+    assert.equal(result.status, 502);
+    assert.doesNotMatch(result.body, /event: response\.function_call_arguments\.done/);
+    assert.doesNotMatch(result.body, /event: response\.output_item\.done/);
+    assert.doesNotMatch(result.body, /"type":"response.completed"/);
+    const payload = JSON.parse(result.body);
+    assert.equal(payload.error.code, "invalid_function_call_arguments");
+    assert.match(payload.error.message, /exec_command/);
+    assert.doesNotMatch(child.testErrors(), /failover/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a streamed function_call with unterminated JSON retries onto a valid call", async () => {
+  let attempts = 0;
+  const gw = await gateway(async (request, response) => {
+    await bodyJson(request);
+    attempts += 1;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(
+      attempts === 1
+        ? toolCallSse("exec_command", '{"cmd":"echo hello')
+        : toolCallSse("exec_command", '{"cmd":"echo hello"}'),
+    );
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(attempts, 2);
+    assert.doesNotMatch(result.body, /invalid_function_call_arguments/);
+    assert.match(result.body, /function_call_arguments\.done/);
+    assert.match(result.body, /echo hello/);
+    assert.doesNotMatch(child.testErrors(), /failover/);
+    assert.match(child.testErrors(), /invalid function_call arguments; retrying/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+const GO_MESSAGES_262K = {
+  slug: "opencode-go-messages/qwen3.7-max",
+  gatewayModel: "opencode-go-messages-qwen3-7-max",
+};
+const GO_FLASH = {
+  slug: "opencode-go/glm-5.3-flash",
+  gatewayModel: "opencode-go-glm-5-3-flash",
+};
+const GO_SMALL_CHAIN = "opencode-go-messages/qwen3.8-max";
+
+function consoleGoNumericOverflowBody() {
+  const inner = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message:
+        "Error from provider (Console Go): Upstream request failed: [invalid_request_error] "
+        + "Prompt too long: about 434983 tokens estimated, but the maximum context length is 262144 tokens including the completion. "
+        + "Reduce the length of the messages.",
+    },
+  });
+  return JSON.stringify({
+    error: {
+      message:
+        `litellm.BadRequestError: AnthropicException - ${inner}. Received Model Group=${GO_MESSAGES_262K.gatewayModel}\nAvailable Model Group Fallbacks=None`,
+      type: null,
+      param: null,
+      code: "400",
+    },
+  });
+}
+
+function compactBody(slug) {
+  return {
+    model: slug,
+    stream: false,
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Remember 42." }],
+      },
+    ],
+  };
+}
+
+function compactSuccessJson() {
+  return JSON.stringify({
+    id: "resp-summary",
+    object: "response",
+    output: [
+      { type: "message", content: [{ type: "output_text", text: "compact summary" }] },
+    ],
+    usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+  });
+}
+
+async function oversizedWindowsExcept(keepSlugs = []) {
+  const { LISTED_MODELS } = await import("../src/model-registry.mjs");
+  const keep = new Set(keepSlugs);
+  return LISTED_MODELS.filter(
+    (model) => !keep.has(model.slug) && Number(model.contextWindow) >= 434983,
+  ).map((model) => model.slug);
+}
+
+test("compact overflow hops to a larger same-family window without cooldown", async () => {
+  const overflow = consoleGoNumericOverflowBody();
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body.model);
+    if (body.model === GO_MESSAGES_262K.gatewayModel) {
+      const payload = Buffer.from(overflow, "utf8");
+      response.writeHead(400, {
+        "Content-Type": "application/json",
+        "Content-Length": String(payload.length),
+      });
+      response.end(payload);
+      return;
+    }
+    const payload = Buffer.from(compactSuccessJson(), "utf8");
+    response.writeHead(200, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [GO_SMALL_CHAIN],
+    hiddenModels: await oversizedWindowsExcept([GO_FLASH.slug]),
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, compactBody(GO_MESSAGES_262K.slug), {
+      endpoint: "/responses/compact",
+    });
+    assert.equal(result.status, 200, result.body);
+    assert.deepEqual(seen, [GO_MESSAGES_262K.gatewayModel, GO_FLASH.gatewayModel]);
+    assert.match(child.testErrors(), /compaction\/context_length/);
+    const cooldownFile = path.join(child.stateDir, "provider-cooldowns.json");
+    if (existsSync(cooldownFile)) {
+      const stored = JSON.parse(readFileSync(cooldownFile, "utf8"));
+      assert.equal(stored["opencode-go"], undefined);
+      assert.equal(stored["opencode-go-messages"], undefined);
+    }
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("an ordinary turn never hops on a Console Go context-length 400", async () => {
+  const overflow = consoleGoNumericOverflowBody();
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body.model);
+    const payload = Buffer.from(overflow, "utf8");
+    response.writeHead(400, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [GO_SMALL_CHAIN],
+    hiddenModels: await oversizedWindowsExcept([GO_FLASH.slug]),
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, {
+      model: GO_MESSAGES_262K.slug,
+      stream: true,
+      input: "hello",
+    });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], GO_MESSAGES_262K.gatewayModel);
+    assert.equal(result.status, 400);
+    const payload = JSON.parse(result.body);
+    assert.equal(payload.error.code, "context_length_exceeded");
+    assert.doesNotMatch(child.testErrors(), /compaction\/context_length/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("compact overflow without a larger window is a translated context error", async () => {
+  const overflow = consoleGoNumericOverflowBody();
+  const gw = await gateway(async (request, response) => {
+    await bodyJson(request);
+    const payload = Buffer.from(overflow, "utf8");
+    response.writeHead(400, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [GO_SMALL_CHAIN],
+    hiddenModels: await oversizedWindowsExcept(),
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, compactBody(GO_MESSAGES_262K.slug), {
+      endpoint: "/responses/compact",
+    });
+    assert.equal(result.status, 400, result.body);
+    const payload = JSON.parse(result.body);
+    assert.equal(payload.error.code, "context_length_exceeded");
+    assert.match(payload.error.message, /434,983 tokens/);
+    assert.match(payload.error.message, /262,144-token context window/);
+    assert.doesNotMatch(result.body, /litellm\.BadRequestError/);
+    assert.doesNotMatch(result.body, /Available Model Group Fallbacks/);
+    assert.doesNotMatch(child.testErrors(), /compaction\/context_length/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("Wethink turns wait behind the configured in-flight limit instead of hitting the upstream concurrently", async () => {
+  let markFirstStarted;
+  let releaseFirst;
+  const firstStarted = new Promise((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  let calls = 0;
+  let active = 0;
+  let peak = 0;
+  const gw = await gateway(async (_request, response) => {
+    const call = ++calls;
+    active += 1;
+    peak = Math.max(peak, active);
+    try {
+      if (call === 1) {
+        markFirstStarted();
+        await firstGate;
+      }
+      const payload = Buffer.from(contentSse(`wethink-queue-${call}`), "utf8");
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Content-Length": String(payload.length),
+      });
+      response.end(payload);
+    } finally {
+      active -= 1;
+    }
+  });
+  const model = userModelEntry({
+    providerId: "wethink",
+    upstreamId: "queue-fixture",
+    priority: 900,
+  });
+  const routerPort = await openPort();
+  const child = run({
+    ...routerEnv(gw.port, routerPort),
+    MODEL_ROUTER_WETHINK_MAX_INFLIGHT: "1",
+    MODEL_ROUTER_WETHINK_MAX_QUEUED: "1",
+    MODEL_ROUTER_WETHINK_MAX_QUEUED_BYTES: String(1024 * 1024),
+    MODEL_ROUTER_WETHINK_QUEUE_TIMEOUT_MS: "5000",
+  }, {
+    chain: [],
+    enabled: false,
+    userModels: [model],
+    genericProviders: [{
+      id: "wethink",
+      displayName: "Wethink queue fixture",
+      baseUrl: "https://wethink.example.test/v1",
+      adapter: "openai-chat",
+      headers: {},
+      allowPrivate: false,
+      enabled: true,
+    }],
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const first = readRouted(routerPort, { model: model.slug, input: "first", stream: true });
+    await firstStarted;
+
+    const second = readRouted(routerPort, { model: model.slug, input: "second", stream: true });
+    const healthUrl = `${callerBaseUrl(routerPort, CALLER_KEY)}/health`;
+    const deadline = Date.now() + 3_000;
+    let queued = 0;
+    while (Date.now() < deadline) {
+      const health = await fetch(healthUrl);
+      const payload = await health.json();
+      queued = payload.resources?.providerConcurrency?.wethink?.queued || 0;
+      if (queued === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(queued, 1, "the second Wethink turn should be visible in the bounded queue");
+
+    const overflow = await readRouted(routerPort, { model: model.slug, input: "third", stream: true });
+    assert.equal(overflow.status, 503, overflow.body);
+    assert.equal(JSON.parse(overflow.body).error.code, "ERR_PROVIDER_QUEUE_FULL");
+    assert.equal(calls, 1, "queued turns must not reach the upstream before a slot is released");
+
+    releaseFirst();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    assert.equal(firstResult.status, 200, firstResult.body);
+    assert.equal(secondResult.status, 200, secondResult.body);
+    assert.equal(calls, 2);
+    assert.equal(peak, 1, "the upstream must never exceed the configured in-flight limit");
+  } finally {
+    releaseFirst();
     await stopChild(child);
     await closeServer(gw.server);
   }

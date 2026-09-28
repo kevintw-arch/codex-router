@@ -24,6 +24,7 @@ import {
 import { ensureCheckoutReadable, protectPrivateFile } from "./file-security.mjs";
 import { providerApiKeyServiceEnvironment } from "./provider-api-key-service-environment.mjs";
 import { serviceProxyEnvironment } from "./proxy-environment.mjs";
+import { serviceGrokPatchHookEnvironment } from "./grok-patch-hook-settings.mjs";
 import {
   skipServiceManagerCall,
   assertServiceWriteIsolated,
@@ -84,6 +85,7 @@ function wrapper() {
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
     ...serviceProxyEnvironment(),
+    ...serviceGrokPatchHookEnvironment(),
     ...providerApiKeyServiceEnvironment(),
     // The LiteLLM gateway is a Python process. Force UTF-8 output so its
     // startup banner and logs do not crash on Windows systems whose default
@@ -103,11 +105,13 @@ function wrapper() {
 // window style of 0. Without it the wrapper owned a console window that stayed
 // on screen for the router's lifetime and reappeared on every watchdog restart.
 //
-// The `True` wait flag is what keeps Task Scheduler's restart settings alive:
-// Run then blocks until the wrapper exits and returns its exit code, which the
-// script re-raises through WScript.Quit. Quitting with a fixed 0 (or letting the
-// script fall off the end) would report every crash as a clean exit and silently
-// disable RestartCount/RestartInterval.
+// The `True` wait flag keeps the task instance alive for the router's lifetime
+// so Task Scheduler state and `schtasks /End` track the real process tree.
+// Propagating the wrapper exit code still matters for diagnostics
+// (`LastTaskResult`), but it does not drive relaunch: Task Scheduler's
+// RestartOnFailure only covers actions that fail to start, not a non-zero
+// exit after a successful start (issue #581). Relaunch after exit or a power
+// event comes from the minute heartbeat trigger in installTask().
 function launcher() {
   // A Windows path cannot contain a double quote, but escape it anyway so a
   // hand-edited state directory can never break out of the string literal.
@@ -203,10 +207,15 @@ function installTask() {
     // around the launcher path never pass through powershell.exe's -Command
     // reparse or the schtasks argument escaper.
     "$action = New-ScheduledTaskAction -Execute $env:CODEX_ROUTER_TASK_EXECUTE -Argument $env:CODEX_ROUTER_TASK_ARGUMENT",
-    "$trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)",
-    "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew",
+    // Logon alone never re-fires on wake/fast-startup, and RestartOnFailure
+    // does not relaunch after a started action exits (issue #581). The minute
+    // heartbeat is the supervisor: MultipleInstances IgnoreNew drops it while
+    // the router is alive, and StartWhenAvailable catches ticks missed in sleep.
+    "$logon = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)",
+    "$heartbeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 9999)",
+    "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable",
     "$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited",
-    "Register-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null",
+    "Register-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK -Action $action -Trigger @($logon, $heartbeat) -Settings $settings -Principal $principal -Force | Out-Null",
   ].join("; ");
   try {
     execFileSync(
@@ -387,6 +396,13 @@ function taskExists() {
   }
 }
 
+function setTaskEnabled(enabled) {
+  schtasks(
+    ["/Change", "/TN", taskName, enabled ? "/ENABLE" : "/DISABLE"],
+    { quiet: true, mutating: true },
+  );
+}
+
 function taskState() {
   const script =
     "try { [Console]::Out.Write((Get-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK).State.ToString()) } catch { exit 1 }";
@@ -459,6 +475,7 @@ if (command === "render") {
   // test install is a safety violation, not a restricted Task Scheduler
   // failure, and must exit non-zero without touching the host filesystem.
   guardLauncherWrite();
+  let launcherFailure;
   try {
     // Ensure the checkout directory is readable by the Limited-level scheduled
     // task. An elevated installer creates files with ACLs that only allow the
@@ -477,7 +494,8 @@ if (command === "render") {
     endTask();
     installTask();
     schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
-  } catch {
+  } catch (error) {
+    launcherFailure = error;
     // Scheduled-task creation can be restricted in a non-elevated terminal. The
     // launchers are still written, so the install is reported as success and
     // the caller can retry -- but endTask() has already stopped whatever was
@@ -492,9 +510,36 @@ if (command === "render") {
       // Nothing left to start; the caller's readiness check reports the failure.
     }
   }
+  // `path` names a file the caller is told this install produced, so read it
+  // back rather than assume it. The catch above was written for a restricted
+  // Task Scheduler, but writeLaunchers() runs inside it too: a failed ACL
+  // hardening unlinks the temporary and leaves nothing at `path`, and the
+  // swallowed exception was the only evidence that happened. Reporting a task
+  // that points at a launcher which is not there is the "installed but missing
+  // from disk" of issue #760 -- and because install still exited 0, the
+  // operator's first sign of trouble was the readiness wait failing 300
+  // seconds later with the health probe's own bare "fetch failed".
+  const launchers = existsSync(wrapperPath) && existsSync(launcherPath);
   // Launchers alone are not an installed service. A restricted scheduler (or
   // a test-mode mutation guard) must not claim success when the task is absent.
-  process.stdout.write(`${JSON.stringify({ installed: taskExists(), path: wrapperPath })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ installed: launchers && taskExists(), launchers, path: wrapperPath })}\n`,
+  );
+  if (!launchers) {
+    // A missing launcher is not the survivable partial install the catch above
+    // tolerates: nothing the task could run exists. Say why, and fail here so
+    // the installer stops on this step instead of on a health probe that can
+    // only report that nothing is listening.
+    console.error(
+      `Failed to write the service launchers to ${STATE_DIR}.`
+        + (launcherFailure
+          ? ` ${launcherFailure instanceof Error ? launcherFailure.message : String(launcherFailure)}`
+          : ""),
+    );
+    // exitCode, not exit(): process.stdout is asynchronous for a Windows
+    // console, and exiting here would truncate the JSON line written above.
+    process.exitCode = 1;
+  }
 } else if (command === "uninstall") {
   // Refuse before `/End`, `/Delete`, or any filesystem removal when a test has
   // not redirected its service state directory.
@@ -530,12 +575,40 @@ if (command === "render") {
     `${JSON.stringify({ installed, loaded, state })}\n`,
   );
 } else if (command === "stop") {
-  // Stopping is idempotent, like uninstall and restart: a task that is missing
-  // or already idle is the state the caller asked for, not an error to raise.
-  endTask();
+  // A heartbeat trigger must not undo an explicit stop. Disable the task before
+  // ending the active instance so scheduled ticks stay inert until start/restart.
+  // If the task is already missing, stopping remains idempotent.
+  if (taskExists()) {
+    setTaskEnabled(false);
+    endTask();
+  }
   process.stdout.write(`${JSON.stringify({ state: "stopped" })}\n`);
 } else {
-  if (command === "restart") endTask();
-  schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
-  process.stdout.write(`${JSON.stringify({ state: "running" })}\n`);
+  // start and restart. `stop` above has always guarded on taskExists(); these
+  // two did not, so an absent registration reached the operator as
+  // schtasks.exe's own complaint about `/Change` against a name that is not
+  // there -- with no statement of which task, and no fix (issue #760). That
+  // state is reachable: a restricted Task Scheduler leaves `install` reporting
+  // `installed: false` with the launchers written, and the reporter also had
+  // the task torn out from under them by the rollback #767 removed.
+  //
+  // There is nothing to recover here. `/Run` would fail the same way one call
+  // later, and re-registering the task behind a `start` would make a lifecycle
+  // verb quietly perform an install -- the asymmetry the "stop and start act
+  // on the same layer" rule exists to prevent. So name the task, say it is not
+  // registered, and point at the command that registers it.
+  if (!taskExists()) {
+    console.error(
+      `The "${taskName}" scheduled task is not registered, so there is nothing to ${command}. `
+        + "Register it with `node src/service.mjs install`, or repair the whole "
+        + "installation with `./model-router.ps1 codex doctor --fix`.",
+    );
+    // exitCode, not exit(): stdout is asynchronous for a Windows console.
+    process.exitCode = 1;
+  } else {
+    if (command === "restart") endTask();
+    setTaskEnabled(true);
+    schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
+    process.stdout.write(`${JSON.stringify({ state: "running" })}\n`);
+  }
 }

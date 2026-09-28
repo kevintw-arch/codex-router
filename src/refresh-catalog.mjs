@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { nativeCatalogCanRefreshInPlace } from "./catalog.mjs";
+import { refreshNativeAccountCatalog } from "./native-account-catalog.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
 import {
   beginLoginFreeRefresh,
@@ -31,9 +33,19 @@ function checked(run, script, args) {
   return result;
 }
 
+export function refreshCatalogCompletionMessage(status) {
+  if (status === "disabled") {
+    return "Bundled native and external model catalogs refreshed. Fully quit and reopen Codex.\n";
+  }
+  if (status === "failed" || status === "unavailable" || status === "stale-client") {
+    return "External models refreshed; native models were rebuilt from available cached and bundled data because the live account catalog could not be refreshed. Fully quit and reopen Codex.\n";
+  }
+  return "Native account, bundled, and external model catalogs refreshed. Fully quit and reopen Codex.\n";
+}
+
 function restoreTransport(
   run,
-  { signed, loginFree, loginFreeModel, loginFreeDisplayModel },
+  { signed, signedProviderMode, loginFree, loginFreeModel, loginFreeDisplayModel },
   aliasFor,
 ) {
   if (loginFree) {
@@ -48,7 +60,12 @@ function restoreTransport(
     );
   } else {
     checked(run, "config-manager.mjs", ["enable"]);
-    if (signed) checked(run, "config-manager.mjs", ["signed-enable"]);
+    if (signed) {
+      checked(run, "config-manager.mjs", [
+        "signed-enable",
+        ...(signedProviderMode === "root-openai" ? ["--preserve-root-openai"] : []),
+      ]);
+    }
   }
   try {
     checked(run, "catalog.mjs", []);
@@ -85,6 +102,8 @@ function restoreTransport(
 
 async function refreshCatalogUnlocked({
   run = nodeRunner,
+  canRefreshInPlace = nativeCatalogCanRefreshInPlace,
+  refreshAccountCatalog = refreshNativeAccountCatalog,
   aliases = readNativeAliases,
   aliasFor = nativeAliasFor,
   journal = {
@@ -93,6 +112,7 @@ async function refreshCatalogUnlocked({
     read: readLoginFreeRefreshJournal,
   },
 } = {}) {
+  const nativeAccountRefresh = await refreshAccountCatalog({ force: true });
   // A killed refresh can leave the exact direct provider source parked while
   // the login-free provider state is intentionally retained. Only the private
   // journal written by this operation makes that otherwise ambiguous pair
@@ -116,6 +136,7 @@ async function refreshCatalogUnlocked({
   }
   const transport = {
     signed,
+    signedProviderMode: signed ? status.signed_provider_mode : undefined,
     loginFree,
     loginFreeDisplayModel: loginFree
       ? pendingJournal?.displayModel || status.model
@@ -126,6 +147,18 @@ async function refreshCatalogUnlocked({
   };
   let restoreNeeded = false;
   let catalogResult;
+  // The router refreshes a known-native account cache directly, independently
+  // of model_catalog_json. Rebuild from it without rewriting config.toml; this
+  // also avoids needless failures when another Windows process has the config
+  // open without delete sharing. Login-free mode still requires the journaled
+  // transport transition below.
+  if (routed && !loginFree && canRefreshInPlace()) {
+    catalogResult = checked(run, "catalog.mjs", ["--refresh-native"]);
+    return {
+      catalogOutput: catalogResult.stdout || "",
+      nativeAccountRefresh: nativeAccountRefresh.status,
+    };
+  }
   try {
     if (routed) {
       if (loginFree) {
@@ -168,7 +201,10 @@ async function refreshCatalogUnlocked({
     }
     throw error;
   }
-  return { catalogOutput: catalogResult.stdout || "" };
+  return {
+    catalogOutput: catalogResult.stdout || "",
+    nativeAccountRefresh: nativeAccountRefresh.status,
+  };
 }
 
 export async function refreshCatalog({
@@ -180,9 +216,9 @@ export async function refreshCatalog({
 }
 
 async function main() {
-  const { catalogOutput } = await refreshCatalog();
+  const { catalogOutput, nativeAccountRefresh } = await refreshCatalog();
   if (catalogOutput) process.stdout.write(catalogOutput);
-  process.stdout.write("Native and external model catalogs refreshed. Fully quit and reopen Codex.\n");
+  process.stdout.write(refreshCatalogCompletionMessage(nativeAccountRefresh));
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

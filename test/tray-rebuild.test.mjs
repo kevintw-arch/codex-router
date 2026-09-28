@@ -443,6 +443,20 @@ test("each companion fingerprints its own sources", () => {
   assert.equal(traySourceFingerprint(root, "aix"), "");
 });
 
+test("the macOS tray fingerprint includes its full-Xcode resolver", () => {
+  const fakeRoot = scratch();
+  try {
+    const resolver = path.join(fakeRoot, "src", "macos-developer-tools.mjs");
+    mkdirSync(path.dirname(resolver), { recursive: true });
+    writeFileSync(resolver, "before\n", "utf8");
+    const before = traySourceFingerprint(fakeRoot, "darwin");
+    writeFileSync(resolver, "after\n", "utf8");
+    assert.notEqual(traySourceFingerprint(fakeRoot, "darwin"), before);
+  } finally {
+    rmSync(fakeRoot, { recursive: true, force: true });
+  }
+});
+
 test("one companion location: the Node and shell sides name the same directory", () => {
   // Three copies of this path drifted apart before -- paths.mjs, the build
   // script default, and trayBundleDir -- which is how a machine ends up with a
@@ -1099,6 +1113,8 @@ test("Control Center fingerprints include renderer, build config, and shared ico
     ["apps", "control-center", "vite.config.ts"],
     ["apps", "control-center", "tsconfig.json"],
     ["apps", "control-center", "assets", "icon.png"],
+    ["apps", "control-center", "assets", "trayTemplate.png"],
+    ["apps", "control-center", "assets", "trayTemplate@2x.png"],
   ]) {
     const fakeRoot = scratch();
     try {
@@ -1118,9 +1134,10 @@ test("Control Center fingerprints include renderer, build config, and shared ico
 test("desktop shells keep their routing mark while the Control Center sidebar stays text-only", () => {
   const script = readFileSync(path.join(root, "scripts", "build-app-icon.sh"), "utf8");
   assert.match(script, /ModelRouterTray\/Resources\/AppIcon\.svg/);
-  for (const asset of ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico"]) {
+  for (const asset of ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico", "trayTemplate.png", "trayTemplate@2x.png"]) {
     assert.match(script, new RegExp(`control_center_assets/${asset.replaceAll(".", "\\.")}`));
   }
+  assert.match(script, /Sources\/Resources\/RouterMark\.svg/);
   assert.match(script, /scripts\/build-ico\.mjs/);
 
   const renderer = readFileSync(path.join(root, "apps", "control-center", "src", "App.tsx"), "utf8");

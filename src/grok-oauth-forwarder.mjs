@@ -29,6 +29,7 @@ import {
 } from "./grok-oauth-tool-alias.mjs";
 import {
   applyResponsesEvent,
+  chatServiceTierFields,
   classifyAfterToolRepair,
   createTurnState,
   DEFAULT_PROGRESS_ONLY_MAX_TEXT,
@@ -44,10 +45,17 @@ import {
   toolCallDeltas,
   withProgressOnlyNudge,
 } from "./grok-oauth-turn.mjs";
+import { knownServiceTier } from "./request-diagnostics.mjs";
 import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
+import { createGrokInflightGate, grokInflightLimit, responseWithInflightRelease } from "./grok-inflight.mjs";
+import { grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
 
-installStableFetchTransport();
+// This process carries only Grok traffic, so its whole pool outlasts the
+// router's stall guard. Undici's 300s default would otherwise end a long
+// reasoning pause with UND_ERR_BODY_TIMEOUT before the guard could decide.
+installStableFetchTransport({ bodyTimeoutMs: grokTransportIdleTimeoutMs() });
+const grokInflight = createGrokInflightGate(grokInflightLimit());
 
 // LiteLLM speaks OpenAI Chat Completions to this forwarder. It reuses the
 // official Grok CLI OAuth session and translates to xAI's Responses proxy.
@@ -119,12 +127,30 @@ const HOSTED_SEARCH_FUNCTION_NAMES = new Set(["web_search", "x_search"]);
 // receives the upstream model id (LiteLLM translates OAuth slugs before the
 // request arrives), so the lookup goes provider + upstreamModel, not slug.
 export function hostedSearchEnabledFor(upstreamModel, models = MODELS) {
-  return models.some(
-    (model) =>
-      model.provider === "grok-oauth" &&
-      model.upstreamModel === upstreamModel &&
-      model.searchTool?.mode === "hosted",
+  return grokOAuthEntries(upstreamModel, models).some(
+    (model) => model.searchTool?.mode === "hosted",
   );
+}
+
+function grokOAuthEntries(upstreamModel, models = MODELS) {
+  return models.filter(
+    (model) => model.provider === "grok-oauth" && model.upstreamModel === upstreamModel,
+  );
+}
+
+// The same rule decides the other two per-model facts this bridge needs, so
+// that shipping another Grok OAuth model stays a registry change. `xhigh` is a
+// real rung only where the entry lists it and is otherwise clamped to `high`
+// rather than sent through and rejected, and the Fast tier is offered only by
+// a route that declares a service tier of its own.
+export function xhighEnabledFor(upstreamModel, models = MODELS) {
+  return grokOAuthEntries(upstreamModel, models).some((model) =>
+    model.reasoningLevels?.some((level) => level.effort === "xhigh"),
+  );
+}
+
+export function serviceTierEnabledFor(upstreamModel, models = MODELS) {
+  return grokOAuthEntries(upstreamModel, models).some((model) => model.serviceTiers?.length);
 }
 
 function grokClientVersion() {
@@ -184,7 +210,7 @@ function messageContentParts(content, textType) {
 function mapEffort(effort, model) {
   if (effort === "minimal") return "low";
   if (["none", "low"].includes(effort)) return "low";
-  if (effort === "xhigh") return model === "grok-4.6" ? "xhigh" : "high";
+  if (effort === "xhigh") return xhighEnabledFor(model) ? "xhigh" : "high";
   if (effort === "max") return "high";
   return ["medium", "high"].includes(effort) ? effort : undefined;
 }
@@ -359,6 +385,9 @@ export function toResponsesRequest(chat, options = {}) {
   }
 
   const request = { model: chat.model, input, stream: true, store: false };
+  if (serviceTierEnabledFor(chat.model) && knownServiceTier(chat.service_tier)) {
+    request.service_tier = knownServiceTier(chat.service_tier);
+  }
   if (instructions) request.instructions = instructions;
   const effort = mapEffort(chat.reasoning_effort, chat.model);
   if (effort) request.reasoning = { effort };
@@ -444,7 +473,7 @@ function conversationId(messages) {
   ].join("-");
 }
 
-function upstreamHeaders(accessToken, model, messages) {
+function upstreamHeaders(accessToken, model, messages, requestId = randomUUID()) {
   const sessionId = conversationId(messages);
   return {
     Authorization: `Bearer ${accessToken}`,
@@ -456,13 +485,31 @@ function upstreamHeaders(accessToken, model, messages) {
     "x-grok-client-identifier": "grok-shell",
     "x-grok-client-mode": "headless",
     "x-grok-conv-id": sessionId,
-    "x-grok-req-id": randomUUID(),
+    "x-grok-req-id": requestId,
     "x-grok-model-override": model,
     "x-grok-session-id": sessionId,
     "x-grok-agent-id": randomUUID(),
     "x-grok-turn-idx": "1",
     "User-Agent": grokUserAgent(),
   };
+}
+
+function upstreamAttemptTiming(label, attempt, endedAt = Date.now()) {
+  if (!attempt) return "";
+  const sinceStart = (value) =>
+    Number.isFinite(value) ? Math.max(0, value - attempt.startedAt) : "none";
+  return [
+    `${label}_req=${attempt.requestId}`,
+    `${label}_headers_ms=${sinceStart(attempt.headersAt)}`,
+    `${label}_first_event_ms=${sinceStart(attempt.firstEventAt)}`,
+    `${label}_total_ms=${sinceStart(attempt.endedAt ?? endedAt)}`,
+  ].join(" ");
+}
+
+function logUpstreamPhaseFailure(label, model, attempt, error) {
+  console.error(
+    `[grok-oauth] upstream-phase-failed=true phase=${label} model=${model} ${upstreamAttemptTiming(label, attempt)} error=${error?.name || "Error"}`,
+  );
 }
 
 // Parse the upstream Responses SSE and invoke callbacks per normalized event.
@@ -475,10 +522,19 @@ function nextSseBoundary(buffer) {
   return crlf < lf ? { at: crlf, size: 4 } : { at: lf, size: 2 };
 }
 
+const TERMINAL_RESPONSES_EVENTS = new Set([
+  "response.completed",
+  "response.failed",
+  "response.incomplete",
+  "error",
+]);
+
+// Returns true once the dispatched event was a Responses terminal.
 function dispatchSseBlock(rawEvent, handlers) {
   const event = parseSseBlockEvent(rawEvent);
-  if (event === undefined) return;
+  if (event === undefined) return false;
   handlers(event);
+  return TERMINAL_RESPONSES_EVENTS.has(event?.type);
 }
 
 async function consumeResponsesStream(upstreamBody, handlers) {
@@ -493,20 +549,27 @@ async function consumeResponsesStream(upstreamBody, handlers) {
     while ((boundary = nextSseBoundary(buffer))) {
       const rawEvent = buffer.slice(0, boundary.at);
       buffer = buffer.slice(boundary.at + boundary.size);
-      dispatchSseBlock(rawEvent, handlers);
+      if (dispatchSseBlock(rawEvent, handlers)) {
+        // The first terminal ends the attempt. An upstream that holds its
+        // socket open afterwards must not delay the answer until a transport
+        // timeout, and nothing after the terminal is parsed.
+        await reader.cancel().catch(() => {});
+        return;
+      }
     }
   }
   buffer += decoder.decode();
   if (buffer.trim()) dispatchSseBlock(buffer, handlers);
 }
 
-const OPENAI_ROLE_CHUNK = (id, created, model, delta, finishReason = null) =>
+const OPENAI_ROLE_CHUNK = (id, created, model, delta, finishReason = null, extra = {}) =>
   `data: ${JSON.stringify({
     id,
     object: "chat.completion.chunk",
     created,
     model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
+    ...extra,
   })}\n\n`;
 
 async function handleChatCompletions(request, response) {
@@ -532,8 +595,7 @@ async function handleChatCompletions(request, response) {
   let bufferShortProgress =
     wantsStream &&
     mayRetry &&
-    !strictAfterToolRepair &&
-    progressOnlyConversations.has(conversationKey);
+    (strictAfterToolRepair || progressOnlyConversations.has(conversationKey));
 
   const controller = new AbortController();
   request.once("aborted", () => controller.abort());
@@ -541,12 +603,41 @@ async function handleChatCompletions(request, response) {
     if (!response.writableEnded) controller.abort();
   });
 
-  const requestUpstream = (accessToken, body) => fetch(`${GROK_BASE}/responses`, {
-    method: "POST",
-    headers: upstreamHeaders(accessToken, model, chat?.messages),
-    body: JSON.stringify(body),
-    signal: controller.signal,
-  });
+  const requestUpstream = async (accessToken, body) => {
+    const attempt = {
+      requestId: randomUUID(),
+      startedAt: Date.now(),
+    };
+    let release;
+    try {
+      release = await grokInflight.acquire(controller.signal);
+      attempt.response = await fetch(`${GROK_BASE}/responses`, {
+        method: "POST",
+        headers: upstreamHeaders(accessToken, model, chat?.messages, attempt.requestId),
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      attempt.headersAt = Date.now();
+      if (attempt.response.body) {
+        attempt.response = responseWithInflightRelease(attempt.response, release);
+      } else {
+        release();
+      }
+      release = undefined;
+      return attempt;
+    } catch (error) {
+      release?.();
+      attempt.endedAt = Date.now();
+      if (error && typeof error === "object") {
+        try {
+          error.grokUpstreamAttempt = attempt;
+        } catch {
+          // A non-extensible transport error still keeps its original cause.
+        }
+      }
+      throw error;
+    }
+  };
   let accessToken;
   try {
     accessToken = await ensureFreshGrokOAuthToken();
@@ -560,12 +651,20 @@ async function handleChatCompletions(request, response) {
     });
     return;
   }
-  let upstream = await requestUpstream(accessToken, responsesRequest);
+  let firstAttempt;
+  try {
+    firstAttempt = await requestUpstream(accessToken, responsesRequest);
+  } catch (error) {
+    logUpstreamPhaseFailure("attempt", model, error?.grokUpstreamAttempt, error);
+    throw error;
+  }
+  let upstream = firstAttempt.response;
   if (upstream.status === 401) {
     await upstream.arrayBuffer();
     try {
       accessToken = await ensureFreshGrokOAuthToken({ force: true });
-      upstream = await requestUpstream(accessToken, responsesRequest);
+      firstAttempt = await requestUpstream(accessToken, responsesRequest);
+      upstream = firstAttempt.response;
     } catch {
       writeJson(response, 401, {
         error: {
@@ -600,6 +699,7 @@ async function handleChatCompletions(request, response) {
     toolNameMapper: (name) => toolNameForCodex(name, { viewImageAlias }),
   });
   let emittedDeltaCount = 0;
+  const heldStrictContentDeltas = [];
   let streamStarted = false;
 
   const startStream = () => {
@@ -612,15 +712,64 @@ async function handleChatCompletions(request, response) {
     streamStarted = true;
   };
 
-  // A post-tool turn can only be classified after its terminal event. Hold it
-  // so an invalid repair can still become an HTTP error instead of a 200 that
-  // Codex records as completed. Ordinary turns keep their live streaming.
-  if (wantsStream && !strictAfterToolRepair) startStream();
+  // A post-tool turn can only be classified after its terminal event. Open the
+  // SSE response immediately, but hold all visible text so Codex sees liveness
+  // and reasoning without accepting an uncertified progress sentence.
+  // Once the head is committed, a failed repair becomes one terminal SSE error.
+  if (wantsStream) startStream();
+
+  const rejectUnsuccessfulTurn = (turn, phase, attempt) => {
+    if (turn.terminalStatus === "completed") return false;
+    const status = turn.terminalStatus;
+    const message = status === "missing"
+      ? "Grok ended the upstream response stream without a successful terminal event."
+      : `Grok returned an unsuccessful upstream response (${status}).`;
+    // The error response below carries no usage the router can meter, so the
+    // attempt is recorded without tokens. Keep any provider-reported counts
+    // visible to the operator here rather than dropping them silently.
+    const counts = turn.usage
+      ? ` input_tokens=${turn.usage.prompt_tokens} output_tokens=${turn.usage.completion_tokens}`
+      : "";
+    console.error(
+      `[grok-oauth] upstream-terminal-failed=true phase=${phase} model=${model} terminal=${status}${counts} ${upstreamAttemptTiming(phase, attempt)}`,
+    );
+    if (wantsStream && streamStarted) {
+      endStreamedResponse(response, { message });
+    } else {
+      writeJson(response, 502, {
+        error: { type: "api_error", code: `grok_upstream_response_${status}`, message },
+      });
+    }
+    return true;
+  };
+
+  const emitHeldStrictContent = () => {
+    if (!wantsStream || !streamStarted || heldStrictContentDeltas.length === 0) return;
+    for (const delta of heldStrictContentDeltas) {
+      response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+    }
+    heldStrictContentDeltas.length = 0;
+  };
 
   const emitPendingDeltas = () => {
     if (!wantsStream || !streamStarted) return;
     while (emittedDeltaCount < turnState.deltas.length) {
       const delta = turnState.deltas[emittedDeltaCount];
+      if (
+        strictAfterToolRepair &&
+        Object.hasOwn(delta, "content") &&
+        turnState.toolCalls.length === 0
+      ) {
+        heldStrictContentDeltas.push(delta);
+        emittedDeltaCount += 1;
+        continue;
+      }
+      // A client tool call certifies attempt 1 as actionable. Release any
+      // earlier prose before its tool delta so the original event order stays
+      // intact; a no-tool attempt remains held through terminal classification.
+      if (strictAfterToolRepair && turnState.toolCalls.length > 0) {
+        emitHeldStrictContent();
+      }
       if (
         bufferShortProgress &&
         Object.hasOwn(delta, "content") &&
@@ -636,15 +785,29 @@ async function handleChatCompletions(request, response) {
     }
   };
 
-  await consumeResponsesStream(upstream.body, (event) => {
-    applyResponsesEvent(turnState, event);
-    emitPendingDeltas();
-  });
+  try {
+    await consumeResponsesStream(upstream.body, (event) => {
+      firstAttempt.firstEventAt ??= Date.now();
+      applyResponsesEvent(turnState, event);
+      emitPendingDeltas();
+    });
+    firstAttempt.endedAt = Date.now();
+  } catch (error) {
+    firstAttempt.endedAt = Date.now();
+    logUpstreamPhaseFailure("attempt", model, firstAttempt, error);
+    throw error;
+  }
 
   let turn = finalizeTurn(turnState);
+  // Never repair or replay an unsuccessful first attempt. Its live tool
+  // deltas may already have reached the client; only one terminal error is
+  // legal now. Withheld/backfilled deltas stay withheld on failure.
+  if (rejectUnsuccessfulTurn(turn, "attempt", firstAttempt)) return;
   emitPendingDeltas();
   let retried = false;
   let repairFailure;
+  let repairAttempt;
+  let strictRepairOutputEmitted = false;
 
   const progressOnly = isProgressOnlyStop(turn, { ...holdOptions, afterToolResult });
   if (progressOnly) rememberProgressOnlyConversation(conversationKey);
@@ -659,17 +822,20 @@ async function handleChatCompletions(request, response) {
     const retryRequest = toResponsesRequest(retryChat, { hostedSearchEnabled });
     let secondUpstream;
     try {
-      secondUpstream = await requestUpstream(accessToken, retryRequest);
+      repairAttempt = await requestUpstream(accessToken, retryRequest);
+      secondUpstream = repairAttempt.response;
     } catch (error) {
+      repairAttempt = error?.grokUpstreamAttempt;
       console.error(
-        `[grok-oauth] progress-only-retry-failed=true model=${model} error=${error?.name || "Error"}`,
+        `[grok-oauth] progress-only-retry-failed=true model=${model} ${upstreamAttemptTiming("repair", repairAttempt)} error=${error?.name || "Error"}`,
       );
       secondUpstream = undefined;
     }
     if (secondUpstream && (!secondUpstream.ok || !secondUpstream.body)) {
       await drainUpstreamBody(secondUpstream.body);
+      repairAttempt.endedAt = Date.now();
       console.error(
-        `[grok-oauth] progress-only-retry-failed=true model=${model} status=${secondUpstream.status}`,
+        `[grok-oauth] progress-only-retry-failed=true model=${model} status=${secondUpstream.status} ${upstreamAttemptTiming("repair", repairAttempt)}`,
       );
       if (strictAfterToolRepair) {
         repairFailure = {
@@ -681,45 +847,91 @@ async function handleChatCompletions(request, response) {
       const secondState = createTurnState({
         toolNameMapper: (name) => toolNameForCodex(name, { viewImageAlias }),
       });
-      await consumeResponsesStream(secondUpstream.body, (event) => {
-        applyResponsesEvent(secondState, event);
-      });
+      let emittedRepairDeltaCount = 0;
+      try {
+        await consumeResponsesStream(secondUpstream.body, (event) => {
+          repairAttempt.firstEventAt ??= Date.now();
+          applyResponsesEvent(secondState, event);
+          if (wantsStream && streamStarted && strictAfterToolRepair) {
+            while (emittedRepairDeltaCount < secondState.deltas.length) {
+              const delta = secondState.deltas[emittedRepairDeltaCount];
+              if (Object.hasOwn(delta, "reasoning_content")) {
+                response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+              }
+              emittedRepairDeltaCount += 1;
+            }
+          }
+        });
+        repairAttempt.endedAt = Date.now();
+      } catch (error) {
+        repairAttempt.endedAt = Date.now();
+        logUpstreamPhaseFailure("repair", model, repairAttempt, error);
+        throw error;
+      }
       const second = finalizeTurn(secondState);
+      // Keep both client tools and the private final answer withheld until
+      // response.completed. An item.done followed by EOF/failure is not a
+      // certified repair, even when its arguments look complete.
+      if (strictAfterToolRepair) {
+        if (rejectUnsuccessfulTurn(second, "repair", repairAttempt)) return;
+      } else if (second.terminalStatus !== "completed") {
+        // An optional retry is speculative: the first answer already completed
+        // successfully, so a retry that did not complete is discarded and the
+        // first answer is kept below, exactly as for a failed HTTP retry.
+        console.error(
+          `[grok-oauth] progress-only-retry-failed=true model=${model} terminal=${second.terminalStatus} ${upstreamAttemptTiming("repair", repairAttempt)}`,
+        );
+      }
       retried = true;
       const repair = strictAfterToolRepair
         ? classifyAfterToolRepair(second)
         : { action: shouldPreferRetryTurn(second) ? "tools" : "first" };
       console.error(
-        `[grok-oauth] progress-only-retried=true retries=1 model=${model} prefer=${repair.action}`,
+        `[grok-oauth] progress-only-retried=true retries=1 model=${model} prefer=${repair.action} ${upstreamAttemptTiming("attempt", firstAttempt)} ${upstreamAttemptTiming("repair", repairAttempt)}`,
       );
       if (repair.action === "tools") {
         const usage = strictAfterToolRepair
           ? selectedRetryUsage(turn.usage, second.usage)
           : mergeMappedUsage(turn.usage, second.usage);
         if (wantsStream && streamStarted) {
+          // The repair stayed reasoning-only on the wire until certification.
+          // Its tool deltas are now safe and are emitted exactly once here.
           for (const delta of toolCallDeltas(second)) {
             response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
           }
+          strictRepairOutputEmitted = strictAfterToolRepair;
         }
         turn = {
           contentText: strictAfterToolRepair ? "" : turn.contentText,
           reasoningText: strictAfterToolRepair ? second.reasoningText : turn.reasoningText,
           toolCalls: second.toolCalls,
           usage,
+          serviceTier: undefined,
+          serviceTierUnknown: false,
           deltas: strictAfterToolRepair
             ? toolCallDeltas(second)
             : [...turn.deltas, ...toolCallDeltas(second)],
           finishReason: "tool_calls",
+          terminalStatus: "completed",
         };
         if (streamStarted) emittedDeltaCount = turn.deltas.length;
       } else if (repair.action === "final") {
+        if (wantsStream && streamStarted && strictAfterToolRepair) {
+          response.write(
+            OPENAI_ROLE_CHUNK(id, created, model, { content: repair.contentText }),
+          );
+          strictRepairOutputEmitted = true;
+        }
         turn = {
           contentText: repair.contentText,
           reasoningText: second.reasoningText,
           toolCalls: [],
           usage: selectedRetryUsage(turn.usage, second.usage),
+          serviceTier: undefined,
+          serviceTierUnknown: false,
           deltas: [{ content: repair.contentText }],
           finishReason: "stop",
+          terminalStatus: "completed",
         };
         emittedDeltaCount = 0;
       } else if (repair.action === "fail") {
@@ -729,7 +941,7 @@ async function handleChatCompletions(request, response) {
             "Grok stopped after a tool result. The router retried once, but the retry neither called a tool nor returned a certified final answer.",
         };
       } else {
-        turn = { ...turn, usage: mergeMappedUsage(turn.usage, second.usage) };
+        turn = { ...turn, usage: mergeMappedUsage(turn.usage, second.usage), serviceTier: undefined, serviceTierUnknown: false };
       }
     } else if (strictAfterToolRepair) {
       repairFailure = {
@@ -741,8 +953,12 @@ async function handleChatCompletions(request, response) {
 
   if (repairFailure) {
     console.error(
-      `[grok-oauth] progress-only-unrepairable=true model=${model} code=${repairFailure.code}`,
+      `[grok-oauth] progress-only-unrepairable=true model=${model} code=${repairFailure.code} ${upstreamAttemptTiming("attempt", firstAttempt)} ${upstreamAttemptTiming("repair", repairAttempt)}`,
     );
+    if (wantsStream && streamStarted) {
+      endStreamedResponse(response, { message: repairFailure.message });
+      return;
+    }
     writeJson(response, 502, {
       error: {
         message: repairFailure.message,
@@ -758,27 +974,33 @@ async function handleChatCompletions(request, response) {
   // emittedDeltaCount past the suppressed prefix, so releasing is a no-op there.
   bufferShortProgress = false;
 
+  // A repair may consume multiple tiers. Do not label aggregate billing with
+  // one attempt's tier, even when the selected answer came from that attempt.
+  const tierFields = serviceTierEnabledFor(model) && !retried ? chatServiceTierFields(turn) : {};
   if (wantsStream) {
     const wasStarted = streamStarted;
     startStream();
-    if (wasStarted) {
+    if (wasStarted && !strictRepairOutputEmitted) {
       emitPendingDeltas();
-    } else {
+      emitHeldStrictContent();
+    } else if (!wasStarted) {
       for (const delta of turn.deltas || []) {
         response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
       }
       emittedDeltaCount = turn.deltas?.length || 0;
     }
-    response.write(OPENAI_ROLE_CHUNK(id, created, model, {}, turn.finishReason));
-    if (turn.usage) {
+    response.write(OPENAI_ROLE_CHUNK(id, created, model, {}, turn.finishReason, tierFields));
+    if (turn.usage || Object.keys(tierFields).length) {
       response.write(
-        `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage: turn.usage })}\n\n`,
+        `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage: turn.usage, ...tierFields })}\n\n`,
       );
     }
     response.write("data: [DONE]\n\n");
     response.end();
   } else {
     const message = { role: "assistant", content: turn.contentText || null };
+    const actualTier = tierFields.provider_specific_fields?.grok_service_tier;
+    if (actualTier) response.setHeader("x-codex-router-grok-service-tier", actualTier);
     if (turn.reasoningText) message.reasoning_content = turn.reasoningText;
     if (turn.toolCalls.length) message.tool_calls = turn.toolCalls;
     writeJson(response, 200, {
@@ -788,6 +1010,7 @@ async function handleChatCompletions(request, response) {
       model,
       choices: [{ index: 0, message, finish_reason: turn.finishReason }],
       usage: turn.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      ...tierFields,
     });
   }
 

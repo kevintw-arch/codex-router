@@ -620,6 +620,20 @@ test("OpenClaw client setup uses the shared transactional enable path", () => {
   assert.doesNotMatch(setup, /setupOpenClaw/);
 });
 
+test("Cursor client disconnect uses the Node uninstall path on every platform", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const start = source.indexOf("async function handleClientDisconnect");
+  const end = source.indexOf("async function handleClientUpdate", start);
+  assert.ok(start >= 0 && end > start, "client disconnect helper should be readable");
+  const disconnect = source.slice(start, end);
+  assert.match(disconnect, /cursor-config-manager\.mjs", "uninstall"/);
+  assert.match(disconnect, /config-manager\.mjs", "disable"/);
+  assert.match(disconnect, /installedTargets\(\)/);
+  assert.match(disconnect, /service\.mjs/);
+  assert.doesNotMatch(disconnect, /currentCheckoutInstaller\(/);
+  assert.doesNotMatch(disconnect, /posixScript:\s*"disable"/);
+});
+
 test("login-free control selects a ready external model and restores Codex defaults", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-login-free-"));
   const signedOutCodex = writeSignedOutCodexStub(stateDir);
@@ -698,6 +712,7 @@ test("login-free control selects a ready external model and restores Codex defau
         ["deepseek/deepseek-v4-flash", "hide"],
         ["deepseek/deepseek-v4-flash-vision-exp", "list"],
         ["deepseek/deepseek-v4-pro", "list"],
+        ["deepseek/deepseek-v4.1-flash", "list"],
       ],
     );
     const aliases = JSON.parse(readFileSync(path.join(stateDir, "native-aliases.json"), "utf8"));

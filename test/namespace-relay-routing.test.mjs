@@ -8,7 +8,15 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { GROK_PATCH_HOOK_PREFIX, GROK_PATCH_HOOK_HEADER, GROK_PATCH_HOOK_CAPABILITY } from "../src/grok-patch-hook-transport.mjs";
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { GROK_STRUCTURED_PATCH_CODEC, serializeStructuredPatch } from "../src/grok-structured-patch.mjs";
+import {
+  APPLY_PATCH_TOOL_NAME,
+  GROK_APPLY_PATCH_CREATE_EXAMPLE,
+  GROK_APPLY_PATCH_GUIDANCE_MARKER,
+  GROK_APPLY_PATCH_UPDATE_EXAMPLE,
+} from "../src/grok-apply-patch-guidance.mjs";
 
 // End-to-end proof of the namespace relay through the REAL router: a routed
 // request carrying the client's namespace toolset must reach the (mock)
@@ -890,12 +898,14 @@ async function scenario(
     jsonBody = gatewayJsonBody,
     requestPayload = routedRequestPayload,
     routerEnv = {},
+    requestHeaders = {},
     prepareRouterEnv,
     visionJsonBody,
     expectedStatus = 200,
   } = {},
 ) {
   const gatewayBodies = [];
+  const gatewayHeaders = [];
   const visionBodies = [];
   const gateway = await mockServer(async (request, response) => {
     if (request.url === "/vision/v1/chat/completions" && visionJsonBody) {
@@ -911,6 +921,7 @@ async function scenario(
     if (request.url === "/v1/responses") {
       const gatewayBody = await bodyJson(request);
       gatewayBodies.push(gatewayBody);
+      gatewayHeaders.push(request.headers);
       if (gatewayBody.stream === false) {
         json(response, 200, jsonBody(gatewayBody));
         return;
@@ -943,12 +954,13 @@ async function scenario(
       headers: {
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
+        ...requestHeaders,
       },
       body: JSON.stringify(requestPayload(stream, model)),
     });
     assert.equal(response.status, expectedStatus, `router status ${response.status}`);
     const clientBody = await response.text();
-    return { gatewayBodies, visionBodies, clientBody, router, status: response.status };
+    return { gatewayBodies, gatewayHeaders, visionBodies, clientBody, router, status: response.status };
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -1366,7 +1378,7 @@ test("Groq rejects a known history overflow before spending a vision or gateway 
   }
 });
 
-test("non-Groq routes preserve the full expanded and discovered tool surface", async () => {
+test("non-Groq discovery routes preserve the reduced client and discovered tool surface", async () => {
   const result = await scenario(false, {
     requestPayload: (stream, model) => groqToolSurfacePayload(stream, model, {
       plainTools: 110,
@@ -1377,10 +1389,13 @@ test("non-Groq routes preserve the full expanded and discovered tool surface", a
   });
   assert.equal(result.gatewayBodies.length, 1);
   const outgoing = result.gatewayBodies[0];
-  assert.equal(outgoing.tools.length, 149);
+  assert.equal(outgoing.tools.length, 134);
   const names = new Set(outgoing.tools.map((tool) => tool.name));
-  assert.ok(names.has("codex_app__create_thread"));
-  assert.ok(names.has("plugin_management__uninstall_plugin"));
+  assert.ok(names.has("codex_app__load_workspace_dependencies"));
+  assert.ok(names.has("codex_app__navigate_to_codex_page"));
+  assert.ok(names.has("codex_app__read_thread_terminal"));
+  assert.equal(names.has("codex_app__create_thread"), false);
+  assert.equal(names.has("plugin_management__uninstall_plugin"), false);
   for (let index = 0; index < 20; index += 1) {
     assert.ok(names.has(`discovered_tool_${index}`));
   }
@@ -1538,6 +1553,44 @@ test("Command Code models restore MCP calls Codex pre-flattened before the route
   }
 });
 
+test("Command Code forced tool choice uses the same bounded alias as its tool", async () => {
+  const longName =
+    "mcp__openai_api_key_local_confirmation__confirm_openai_api_key_local_destination";
+  assert.equal(longName.length, 80);
+
+  for (const model of [
+    "commandcode/deepseek-v4-flash",
+    "commandcode-messages/claude-fable-5.1",
+  ]) {
+    const result = await scenario(false, {
+      model,
+      requestPayload: (stream, routeModel) => ({
+        model: routeModel,
+        stream,
+        input: "Call the required tool.",
+        tools: [{
+          type: "function",
+          name: longName,
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+        }],
+        tool_choice: { type: "function", name: longName },
+      }),
+      jsonBody: () => ({ id: "commandcode_choice", output: [] }),
+    });
+
+    assert.equal(result.gatewayBodies.length, 1, model);
+    const outgoing = result.gatewayBodies[0];
+    const providerTool = outgoing.tools.find((tool) => tool.name !== "web_search");
+    assert.ok(providerTool.name.length <= 64, model);
+    assert.notEqual(providerTool.name, longName, model);
+    assert.deepEqual(
+      outgoing.tool_choice,
+      { type: "function", name: providerTool.name },
+      model,
+    );
+  }
+});
+
 test("bounded routes preserve one alias for pre-flattened MCP definitions and history", async () => {
   const namespace = "mcp__neon__apm__production__snapshot__read_only";
   const name = "get_monitor_snapshot_with_complete_context";
@@ -1604,7 +1657,26 @@ test("bounded routes preserve one alias for pre-flattened MCP definitions and hi
 });
 
 test("non-streaming routed responses restore namespace calls before client dispatch", async () => {
-  const result = await scenario(false);
+  const result = await scenario(false, {
+    requestPayload: (stream, model) => {
+      const payload = routedRequestPayload(stream, model);
+      payload.input.push(
+        {
+          type: "function_call",
+          name: "send_message_to_thread",
+          namespace: "codex_app",
+          call_id: "call_prior_followup",
+          arguments: JSON.stringify({ threadId: "thread_1", prompt: "prior" }),
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_prior_followup",
+          output: "{}",
+        },
+      );
+      return payload;
+    },
+  });
   assert.equal(result.gatewayBodies.length, 1);
   assert.equal(result.gatewayBodies[0].stream, false);
 
@@ -1741,6 +1813,56 @@ test("routed tool_search history declares discovered tools and restores their ca
       call_id: "delete-1",
       arguments: '{"id":"evt-1"}',
     });
+  }
+});
+
+// Codex dispatches by the native identity whichever upstream answers, so a
+// route that forwards the flat declarations unchanged must still restore the
+// call. Without turn metadata nothing identifies an MCP tool, and the flat
+// name stays exactly as the provider returned it.
+test("Responses-native routes preserve pre-flattened tools and restore call identities", async () => {
+  for (const [stream, metadata] of [[true, true], [false, true], [true, false], [false, false]]) {
+    const payload = preflattenedCommandCodeMcpPayload(stream, "meta/muse-spark-1.2");
+    if (!metadata) delete payload.client_metadata;
+    const name = payload.tools[0].name;
+    const prior = { type: "function_call", name, call_id: "call_prior", arguments: "{}" };
+    payload.input = [
+      { type: "message", role: "user", content: "Call the monitor snapshot tool again." },
+      prior,
+      { type: "function_call_output", call_id: prior.call_id, output: "{}" },
+    ];
+    payload.tool_choice = { type: "function", name };
+    const call = { ...prior, call_id: "call_flat_response" };
+    const result = await scenario(stream, {
+      model: payload.model,
+      requestPayload: () => payload,
+      sseBody: () => [
+        sseEvent({ type: "response.output_item.done", item: call }),
+        sseEvent({ type: "response.completed" }),
+        "data: [DONE]\n\n",
+      ].join(""),
+      jsonBody: () => ({ id: "resp_flat_json", output: [call] }),
+    });
+    assert.equal(result.gatewayBodies.length, 1);
+    const outgoing = result.gatewayBodies[0];
+    assert.equal(outgoing.model, "meta-muse-spark-1-2");
+    assert.equal(
+      JSON.stringify(outgoing.tools),
+      JSON.stringify(payload.tools),
+      "do not synthesize namespace declarations",
+    );
+    assert.equal(JSON.stringify(outgoing.input), JSON.stringify(payload.input));
+    assert.equal(outgoing.tool_choice, "auto", "retain Meta's existing tool-choice policy");
+    const returned = stream
+      ? functionCallsFromSse(result.clientBody).get(call.call_id)
+      : JSON.parse(result.clientBody).output[0];
+    assert.deepEqual(
+      returned,
+      metadata
+        ? { ...call, namespace: "mcp__apmneonsnapshotro", name: "get_monitor_snapshot" }
+        : call,
+      metadata ? "restore the identity Codex dispatches by" : "never infer from a name prefix",
+    );
   }
 });
 
@@ -1898,11 +2020,17 @@ function goCompatibilityRequestPayload(
       { type: "function_call_output", call_id: "history-discovered", output: "done" },
       {
         type: "custom_tool_call",
+        id: "ctc_history_patch",
         name: "apply_patch",
         call_id: "history-patch",
         input: GO_PATCH,
       },
-      { type: "custom_tool_call_output", call_id: "history-patch", output: "Done!" },
+      {
+        type: "custom_tool_call_output",
+        id: "ctco_history_patch",
+        call_id: "history-patch",
+        output: "Done!",
+      },
       {
         type: "custom_tool_call",
         name: "future_custom",
@@ -2043,6 +2171,14 @@ test("OpenCode Go Responses uses one bounded function-tool contract in both resp
       outgoing.input.find((item) => item.call_id === "history-patch").type,
       "function_call",
     );
+    const patchCall = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call",
+    );
+    const patchOutput = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call_output",
+    );
+    assert.equal(Object.hasOwn(patchCall, "id"), false);
+    assert.equal(Object.hasOwn(patchOutput, "id"), false);
     const futureCustom = outgoing.input.find(
       (item) => item.call_id === "history-future-custom" && item.type === "function_call",
     );
@@ -2132,6 +2268,107 @@ test("OpenCode Go Muse removes recursive tool refs in both response modes", asyn
   }
 });
 
+// Issue #792 added the cycle-closing repair for the direct Meta Muse Spark 1.3
+// Contributor route, but it ran only in the api-forwarder, which understands
+// top-level `type: "function"` tools. A Responses-native endpoint keeps Codex's
+// `type: "namespace"` entries, so the app and MCP toolset -- where the
+// recursive `$defs` actually lives -- reached Meta unchanged and a tool-bearing
+// turn still came back as HTTP 400 `Recursive JSON schemas are not currently
+// supported`. The route's own `toolSchemaRecursion` flag now opts it into the
+// router-side repair too; the sibling Meta route without that measured proof
+// keeps its payload byte-identical, which is the control below.
+test("direct Meta Muse Spark 1.3 Contributor breaks recursive refs inside namespace tools", async () => {
+  const recursiveNamespaceChild = () => ({
+    type: "function",
+    name: "automation_update",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { $ref: "#/$defs/__schema0" },
+        branch: { type: "string" },
+      },
+      $defs: {
+        __schema0: {
+          anyOf: [
+            { type: "string" },
+            { type: "array", items: { $ref: "#/$defs/__schema0" } },
+            {
+              type: "object",
+              additionalProperties: { $ref: "#/$defs/__schema0" },
+            },
+          ],
+        },
+      },
+    },
+  });
+  const requestPayload = (stream, model) => ({
+    model,
+    stream,
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "hi" }],
+      },
+    ],
+    tools: [
+      { type: "namespace", name: "codex_app", tools: [recursiveNamespaceChild()] },
+      {
+        type: "function",
+        name: "inspect",
+        parameters: {
+          type: "object",
+          properties: { child: { $ref: "#/$defs/Row" } },
+          $defs: {
+            Row: {
+              type: "object",
+              properties: { child: { $ref: "#/$defs/Row" } },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const namespaceChildOf = (body) =>
+    body.tools
+      .find((tool) => tool.type === "namespace")
+      .tools.find((tool) => tool.name === "automation_update");
+
+  const verified = await scenario(true, {
+    model: "meta/muse-spark-1.3-contributor",
+    requestPayload,
+  });
+  const outgoing = verified.gatewayBodies[0];
+  const repairedChild = namespaceChildOf(outgoing);
+  // Definitions and acyclic references survive; only the edge that closes the
+  // cycle is blanked.
+  assert.equal(repairedChild.inputSchema.properties.id.$ref, "#/$defs/__schema0");
+  assert.deepEqual(
+    repairedChild.inputSchema.$defs.__schema0.anyOf[1].items,
+    {},
+  );
+  assert.deepEqual(
+    repairedChild.inputSchema.$defs.__schema0.anyOf[2].additionalProperties,
+    {},
+  );
+  const repairedFlatTool = outgoing.tools.find((tool) => tool.name === "inspect");
+  assert.deepEqual(repairedFlatTool.parameters.$defs.Row.properties.child, {});
+
+  const control = await scenario(true, {
+    model: "meta/muse-spark-1.3",
+    requestPayload,
+  });
+  const controlChild = namespaceChildOf(control.gatewayBodies[0]);
+  assert.deepEqual(controlChild.inputSchema.$defs.__schema0.anyOf[1].items, {
+    $ref: "#/$defs/__schema0",
+  });
+  assert.deepEqual(
+    control.gatewayBodies[0].tools.find((tool) => tool.name === "inspect")
+      .parameters.$defs.Row.properties.child,
+    { $ref: "#/$defs/Row" },
+  );
+});
+
 test("OpenCode Go compaction removes native tool history before the strict endpoint", async () => {
   const result = await scenario(false, {
     endpoint: "/responses/compact",
@@ -2210,5 +2447,606 @@ test("OpenCode Go compaction removes native tool history before the strict endpo
   assert.equal(
     outgoing.input.some((item) => item.call_id === "orphan-custom-output"),
     false,
+  );
+});
+
+const GROK_V4A_GRAMMAR = [
+  "start: begin_patch hunk+ end_patch",
+  'begin_patch: "*** Begin Patch" LF',
+  'end_patch: "*** End Patch" LF?',
+  "",
+  "hunk: add_hunk | delete_hunk | update_hunk",
+  'add_hunk: "*** Add File: " filename LF add_line+',
+  "%import common.LF",
+].join("\n");
+
+const GROK_PATCH_UNICODE = [
+  "*** Begin Patch",
+  '*** Add File: café "quotes".txt',
+  "+hello “unicode”",
+  "*** End Patch",
+].join("\n");
+
+function grokApplyPatchPayload(stream, model) {
+  return {
+    model,
+    stream,
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "patch notes" }] },
+      {
+        type: "custom_tool_call",
+        id: "ctc_history",
+        call_id: "call_history",
+        name: APPLY_PATCH_TOOL_NAME,
+        input: "*** Begin Patch\n*** Add File: seed.txt\n+before\n*** End Patch",
+      },
+      { type: "custom_tool_call_output", call_id: "call_history", output: "Done!" },
+    ],
+    tools: [
+      {
+        type: "custom",
+        name: APPLY_PATCH_TOOL_NAME,
+        description: "Apply a patch.",
+        format: { type: "grammar", syntax: "lark", definition: GROK_V4A_GRAMMAR },
+      },
+      {
+        type: "function",
+        name: APPLY_PATCH_TOOL_NAME,
+        description: "ordinary same-name function",
+        parameters: { type: "object", properties: { path: { type: "string" } } },
+      },
+      { type: "custom", name: "future_custom", description: "leave me" },
+    ],
+  };
+}
+
+function grokApplyPatchSseBody() {
+  return [
+    sseEvent({
+      type: "response.output_item.added",
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_unicode",
+        call_id: "call_unicode",
+        name: APPLY_PATCH_TOOL_NAME,
+        input: "",
+      },
+    }),
+    sseEvent({
+      type: "response.custom_tool_call_input.delta",
+      item_id: "ctc_unicode",
+      delta: GROK_PATCH_UNICODE,
+    }),
+    sseEvent({
+      type: "response.output_item.done",
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_unicode",
+        call_id: "call_unicode",
+        name: APPLY_PATCH_TOOL_NAME,
+        input: GROK_PATCH_UNICODE,
+      },
+    }),
+    sseEvent({ type: "response.completed" }),
+    "data: [DONE]\n\n",
+  ].join("");
+}
+
+test("Grok 4.6 OAuth annotates native custom apply_patch and leaves history, collisions, and other models alone", async () => {
+  const guided = await scenario(true, {
+    model: "grok-oauth/grok-4.6",
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  const outgoing = guided.gatewayBodies[0];
+  const custom = outgoing.tools.find((tool) => tool.type === "custom" && tool.name === APPLY_PATCH_TOOL_NAME);
+  const ordinary = outgoing.tools.find((tool) => tool.type === "function" && tool.name === APPLY_PATCH_TOOL_NAME);
+  const otherCustom = outgoing.tools.find((tool) => tool.type === "custom" && tool.name === "future_custom");
+  assert.ok(custom, "native custom apply_patch still reaches LiteLLM as a custom tool");
+  assert.equal(custom.description.startsWith("Apply a patch."), true);
+  assert.equal(custom.description.includes(GROK_APPLY_PATCH_GUIDANCE_MARKER), true);
+  assert.equal(custom.description.includes(GROK_APPLY_PATCH_CREATE_EXAMPLE), true);
+  assert.equal(custom.description.includes(GROK_APPLY_PATCH_UPDATE_EXAMPLE), true);
+  assert.doesNotMatch(custom.description, /```/);
+  assert.deepEqual(custom.format, {
+    type: "grammar",
+    syntax: "lark",
+    definition: GROK_V4A_GRAMMAR,
+  });
+  assert.deepEqual(ordinary.description, "ordinary same-name function");
+  assert.equal(ordinary.description.includes(GROK_APPLY_PATCH_GUIDANCE_MARKER), false);
+  assert.deepEqual(otherCustom.description, "leave me");
+  const history = outgoing.input.find((item) => item.call_id === "call_history");
+  assert.equal(history.type, "custom_tool_call");
+  assert.equal(history.id, "ctc_history");
+  assert.equal(history.name, APPLY_PATCH_TOOL_NAME);
+  assert.equal(history.input, "*** Begin Patch\n*** Add File: seed.txt\n+before\n*** End Patch");
+  const restoredByCallId = new Map();
+  for (const item of responseItemsFromSse(guided.clientBody)) {
+    if (item?.call_id) restoredByCallId.set(item.call_id, item);
+  }
+  const restored = restoredByCallId.get("call_unicode");
+  assert.equal(restored.type, "custom_tool_call");
+  assert.equal(restored.id, "ctc_unicode");
+  assert.equal(restored.input, GROK_PATCH_UNICODE);
+
+  const unguided = await scenario(true, {
+    model: "grok-oauth/grok-4.5",
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  const control = unguided.gatewayBodies[0].tools.find(
+    (tool) => tool.type === "custom" && tool.name === APPLY_PATCH_TOOL_NAME,
+  );
+  assert.equal(control.description, "Apply a patch.");
+  assert.deepEqual(control.format, {
+    type: "grammar",
+    syntax: "lark",
+    definition: GROK_V4A_GRAMMAR,
+  });
+  assert.equal(control.description.includes(GROK_APPLY_PATCH_GUIDANCE_MARKER), false);
+});
+
+const STRUCTURED_OPERATIONS = {
+  operations: [{ op: "add", path: 'café "quotes".txt', lines: ["hello “unicode”"] }],
+};
+function structuredPatchCall(body) {
+  const tool = body.tools.find((tool) => tool.parameters?.properties?.operations);
+  assert.ok(tool, "the Router must declare the structured tool to the gateway");
+  return {
+    type: "function_call", id: "fc_structured", call_id: "call_structured",
+    name: tool.name, arguments: JSON.stringify(STRUCTURED_OPERATIONS),
+  };
+}
+function structuredPatchSse(body) {
+  const call = structuredPatchCall(body);
+  return [
+    sseEvent({ type: "response.output_item.added", output_index: 0, item: { ...call, arguments: "" } }),
+    sseEvent({ type: "response.function_call_arguments.delta", item_id: call.id, output_index: 0, delta: call.arguments }),
+    sseEvent({ type: "response.function_call_arguments.done", item_id: call.id, output_index: 0, arguments: call.arguments }),
+    sseEvent({ type: "response.output_item.done", output_index: 0, item: call }),
+    sseEvent({ type: "response.completed", response: { output: [call] } }),
+    "data: [DONE]\n\n",
+  ].join("");
+}
+
+test("Grok structured patch opt-in crosses the real Router with collision, choice and historical identity intact", async () => {
+  for (const stream of [true, false]) {
+    const result = await scenario(stream, {
+      model: "grok-oauth/grok-4.6",
+      routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+      requestPayload: (stream, model) => ({ ...grokApplyPatchPayload(stream, model), tool_choice: { type: "custom", name: "apply_patch" } }),
+      sseBody: structuredPatchSse,
+      jsonBody: (body) => ({ id: "response_structured", output: [structuredPatchCall(body)] }),
+    });
+    assert.equal(result.gatewayBodies.length, 1, "one request, no hidden model retry");
+    const outgoing = result.gatewayBodies[0];
+    const tool = outgoing.tools.find((tool) => tool.parameters?.properties?.operations);
+    assert.deepEqual(tool.parameters, GROK_STRUCTURED_PATCH_CODEC.parameters);
+    assert.notEqual(tool.name, "apply_patch", "ordinary same-name function keeps its name");
+    assert.equal(outgoing.tools.find((tool) => tool.name === "apply_patch").description, "ordinary same-name function");
+    assert.deepEqual(outgoing.tools.find((tool) => tool.name === "future_custom"), { type: "custom", name: "future_custom", description: "leave me" });
+    assert.deepEqual(outgoing.tool_choice, { type: "function", name: tool.name });
+    const old = outgoing.input.find((item) => item.call_id === "call_history");
+    assert.equal(old.name, tool.name);
+    assert.equal(Object.hasOwn(old, "id"), false);
+    assert.equal(JSON.parse(old.arguments).input, grokApplyPatchPayload(stream, outgoing.model).input[1].input);
+    assert.deepEqual(outgoing.input.find((item) => item.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Done!" });
+    const items = stream ? responseItemsFromSse(result.clientBody) : JSON.parse(result.clientBody).output;
+    const restored = items.filter((item) => item.call_id === "call_structured").at(-1);
+    assert.deepEqual(restored, { type: "custom_tool_call", id: "fc_structured", call_id: "call_structured", name: "apply_patch", input: serializeStructuredPatch(STRUCTURED_OPERATIONS) });
+    assert.equal(result.clientBody.includes('"operations"'), false);
+  }
+});
+
+test("the enabled flag leaves another route and undeclared native patch requests unchanged", async () => {
+  const control = await scenario(true, {
+    model: "grok-oauth/grok-4.5",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  const disabled = await scenario(true, {
+    model: "grok-oauth/grok-4.5",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "0" },
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  assert.deepEqual(control.gatewayBodies, disabled.gatewayBodies);
+  assert.equal(control.clientBody, disabled.clientBody);
+  const undeclared = await scenario(false, {
+    model: "grok-oauth/grok-4.6",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+    requestPayload: (stream, model) => {
+      const payload = grokApplyPatchPayload(stream, model);
+      payload.tools = payload.tools.filter((tool) => tool.type !== "custom" || tool.name !== "apply_patch");
+      return payload;
+    },
+    jsonBody: () => ({ id: "response_no_patch", output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }] }),
+  });
+  assert.equal(undeclared.gatewayBodies[0].tools.some((tool) => tool.parameters?.properties?.operations), false);
+  assert.equal(undeclared.gatewayBodies[0].input.find((item) => item.call_id === "call_history").type, "custom_tool_call");
+});
+
+test("negotiated hook crosses real Router with exact raw history and native framing", async () => {
+  for (const stream of [false, true]) {
+    const raw = ' \n{"operations":[],"number":1.0,"escaped":"\\u0061","unicode":"🧙"}\n';
+    const result = await scenario(stream, {
+      model: "grok-oauth/grok-4.6",
+      routerEnv: { CODEX_ROUTER_GROK_PATCH_HOOK: "1" },
+      requestHeaders: { [GROK_PATCH_HOOK_HEADER]: GROK_PATCH_HOOK_CAPABILITY },
+      requestPayload: (stream, model) => {
+        const payload = grokApplyPatchPayload(stream, model);
+        payload.input[1].input = GROK_PATCH_HOOK_PREFIX + raw;
+        payload.input[2].output = "Native hook denied invalid arguments";
+        payload.tool_choice = { type: "custom", name: "apply_patch" };
+        return payload;
+      },
+      jsonBody: body => ({ output: [{ ...structuredPatchCall(body), arguments: raw }] }),
+      sseBody: body => {
+        const call = { ...structuredPatchCall(body), arguments: raw };
+        return sseEvent({ type: "response.output_item.done", item: call }) + sseEvent({ type: "response.completed", response: { output: [call] } });
+      },
+    });
+    assert.equal(result.gatewayBodies.length, 1);
+    assert.equal(result.gatewayHeaders[0][GROK_PATCH_HOOK_HEADER], undefined, "client capability must not leak to provider");
+    const outgoing = result.gatewayBodies[0];
+    const declared = outgoing.tools.find(t => t.parameters?.properties?.operations);
+    assert.ok(declared);
+    assert.notEqual(declared.name, "apply_patch");
+    assert.equal(outgoing.input.find(i => i.call_id === "call_history").arguments, raw);
+    assert.deepEqual(outgoing.tool_choice, { type: "function", name: declared.name });
+    assert.deepEqual(outgoing.input.find(i => i.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Native hook denied invalid arguments" });
+    const items = stream ? responseItemsFromSse(result.clientBody) : JSON.parse(result.clientBody).output;
+    assert.deepEqual(items.filter(i => i.call_id === "call_structured").at(-1), { type: "custom_tool_call", id: "fc_structured", call_id: "call_structured", name: "apply_patch", input: GROK_PATCH_HOOK_PREFIX + raw });
+  }
+});
+
+test("real Router requires both hook opt-ins and exact model, without affecting v2", async () => {
+  for (const [model, flag, declaration, old] of [
+    ["grok-oauth/grok-4.6", "1", undefined, false],
+    ["grok-oauth/grok-4.6", "0", GROK_PATCH_HOOK_CAPABILITY, false],
+    ["grok-oauth/grok-4.6", "1", "structured-patch-v2", false],
+    ["grok-oauth/grok-4.5", "1", GROK_PATCH_HOOK_CAPABILITY, false],
+    ["grok-oauth/grok-4.6", "1", undefined, true],
+  ]) {
+    const result = await scenario(false, {
+      model, routerEnv: { CODEX_ROUTER_GROK_PATCH_HOOK: flag, CODEX_ROUTER_GROK_STRUCTURED_PATCH: old ? "1" : "0" },
+      requestHeaders: declaration ? { [GROK_PATCH_HOOK_HEADER]: declaration } : {},
+      requestPayload: grokApplyPatchPayload,
+      jsonBody: body => ({ output: old ? [structuredPatchCall(body)] : [] }),
+    });
+    assert.equal(result.gatewayBodies[0].tools.some(t => t.parameters?.properties?.operations), old);
+    if (old) assert.equal(JSON.parse(result.clientBody).output[0].input, serializeStructuredPatch(STRUCTURED_OPERATIONS));
+  }
+});
+
+test("routed turns label assistant messages the way native turns do", async () => {
+  const assistantMessage = (id, text) => ({
+    id,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  });
+  const messageEvents = (index, item) => [
+    sseEvent({ type: "response.output_item.added", output_index: index, item: { ...item, content: [] } }),
+    sseEvent({ type: "response.output_text.delta", output_index: index, item_id: item.id, delta: item.content[0].text }),
+    sseEvent({ type: "response.output_item.done", output_index: index, item }),
+  ];
+  const lastMessage = (body, id) =>
+    responseItemsFromSse(body).filter((item) => item.type === "message" && item.id === id).at(-1);
+
+  const toolTurn = await scenario(true, {
+    model: "opencode-go/deepseek-v4.1-flash",
+    sseBody: () => [
+      sseEvent({ type: "response.created", response: { id: "resp_note" } }),
+      ...messageEvents(0, assistantMessage("msg_note", "Checking the config.")),
+      sseEvent({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "function_call", name: "exec_command", call_id: "call_exec", arguments: "" },
+      }),
+      sseEvent({
+        type: "response.output_item.done",
+        output_index: 1,
+        item: { type: "function_call", name: "exec_command", call_id: "call_exec", arguments: "{}" },
+      }),
+      sseEvent({ type: "response.completed", response: { id: "resp_note", output: [] } }),
+      "data: [DONE]\n\n",
+    ].join(""),
+  });
+  assert.equal(lastMessage(toolTurn.clientBody, "msg_note").phase, "commentary");
+  assert.equal(functionCallsFromSse(toolTurn.clientBody).get("call_exec").phase, undefined);
+
+  const answerTurn = await scenario(true, {
+    model: "opencode-go/deepseek-v4.1-flash",
+    sseBody: () => [
+      sseEvent({ type: "response.created", response: { id: "resp_answer" } }),
+      ...messageEvents(0, assistantMessage("msg_answer", "Done.")),
+      sseEvent({ type: "response.completed", response: { id: "resp_answer", output: [] } }),
+      "data: [DONE]\n\n",
+    ].join(""),
+  });
+  assert.equal(lastMessage(answerTurn.clientBody, "msg_answer").phase, "final_answer");
+});
+
+test("routed native apply_patch relays LiteLLM arguments that are not a leading content wrapper", async () => {
+  const patch = "*** Begin Patch\n*** Update File: src/a.js\n@@\n-const a = 1;\n+const re = /\\d+/;\n*** End Patch";
+  // What pinned LiteLLM 1.96 emits when the provider's arguments are not a
+  // leading {"content": ...} wrapper: legacy argument events carry the
+  // provider text verbatim, and the completed custom_tool_call carries
+  // unwrap_custom_tool_arguments() of it.
+  const calls = [
+    { id: "call_input_key", arguments: JSON.stringify({ input: patch }), input: JSON.stringify({ input: patch }) },
+    { id: "call_content_second", arguments: JSON.stringify({ path: "src/a.js", content: patch }), input: patch },
+  ];
+  const sseBody = () => [
+    sseEvent({ type: "response.created", response: { id: "resp_litellm_custom" } }),
+    ...calls.flatMap((call, index) => [
+      sseEvent({
+        type: "response.output_item.added",
+        output_index: index,
+        item: { type: "custom_tool_call", id: call.id, call_id: call.id, name: "apply_patch", input: "", status: "in_progress" },
+      }),
+      ...call.arguments.match(/[\s\S]{1,10}/g).map((delta) => sseEvent({
+        type: "response.function_call_arguments.delta",
+        output_index: index,
+        item_id: call.id,
+        delta,
+      })),
+      sseEvent({
+        type: "response.function_call_arguments.done",
+        output_index: index,
+        item_id: call.id,
+        arguments: call.arguments,
+      }),
+      sseEvent({
+        type: "response.output_item.done",
+        output_index: index,
+        item: { type: "custom_tool_call", id: call.id, call_id: call.id, name: "apply_patch", input: call.input, status: "completed" },
+      }),
+    ]),
+    sseEvent({ type: "response.completed", response: { id: "resp_litellm_custom", output: [] } }),
+    "data: [DONE]\n\n",
+  ].join("");
+  const result = await scenario(true, {
+    model: "opencode-go/deepseek-v4.1-flash",
+    requestPayload: (stream, model) => ({
+      model,
+      stream,
+      input: "Apply the patch.",
+      tools: [{
+        type: "custom",
+        name: "apply_patch",
+        description: "Apply a patch.",
+        format: { type: "grammar", syntax: "lark", definition: "start: /[\\s\\S]+/" },
+      }],
+    }),
+    sseBody,
+  });
+  assert.ok(
+    result.gatewayBodies[0].tools.some((tool) => tool.type === "custom" && tool.name === "apply_patch"),
+    "native apply_patch still reaches LiteLLM as a custom tool",
+  );
+  const events = result.clientBody.split(/\r?\n/)
+    .filter((line) => line.startsWith("data: {"))
+    .map((line) => JSON.parse(line.slice(6)));
+  assert.equal(events.some((event) => event.type === "error" || event.type === "response.failed"), false);
+  assert.ok(events.some((event) => event.type === "response.completed"), "the turn completes instead of aborting");
+  for (const call of calls) {
+    const inputDone = events.find((event) =>
+      event.type === "response.custom_tool_call_input.done" && event.item_id === call.id);
+    assert.equal(inputDone?.input, call.input, `${call.id} input.done`);
+    const closed = events.find((event) =>
+      event.type === "response.output_item.done" && event.item?.call_id === call.id);
+    assert.equal(closed.item.type, "custom_tool_call");
+    assert.equal(closed.item.input, call.input, `${call.id} item input`);
+  }
+});
+
+test("a routed turn whose tool calls leaked into the reasoning channel still runs them", async () => {
+  // Captured from rollout 01a0924e (opencode-go hy4-preview, 12 September 2026):
+  // the model wrote its calls as text on the reasoning channel, nothing reached
+  // the tool_calls array, and Codex ended the turn on an empty assistant
+  // message -- "Worked for 3m 58s" with no answer under it.
+  const n = "6124c78e";
+  const leaked =
+    "Boot is running. Let me keep reading the behavior code while it comes up." +
+    `<tool_calls:${n}><tool_call:${n}>exec_command` +
+    `<arg_key:${n}>cmd</arg_key:${n}><arg_value:${n}>tail -5 .qa/eo-up.log</arg_value:${n}>` +
+    `<arg_key:${n}>workdir</arg_key:${n}><arg_value:${n}>/tmp/eo</arg_value:${n}>` +
+    `</tool_call:${n}></tool_calls:${n}>`;
+  const emptyMessage = {
+    id: "msg_blank",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [],
+  };
+  const result = await scenario(true, {
+    // The route the capture came from. Recovery is Hy4-only on purpose: this
+    // markup is Hy4's native tool-call syntax, and scanning every routed
+    // provider's text for it would turn prose that merely quotes it into
+    // executed calls.
+    model: "opencode-go/hy4-preview",
+    sseBody: () => [
+      sseEvent({ type: "response.created", response: { id: "resp_leak" } }),
+      sseEvent({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_leak", summary: [] },
+      }),
+      sseEvent({
+        type: "response.reasoning_summary_text.delta",
+        output_index: 0,
+        item_id: "rs_leak",
+        delta: leaked,
+      }),
+      sseEvent({
+        type: "response.reasoning_summary_text.done",
+        output_index: 0,
+        item_id: "rs_leak",
+        text: leaked,
+      }),
+      sseEvent({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_leak", summary: [{ type: "summary_text", text: leaked }] },
+      }),
+      sseEvent({ type: "response.output_item.added", output_index: 1, item: emptyMessage }),
+      sseEvent({ type: "response.output_item.done", output_index: 1, item: emptyMessage }),
+      sseEvent({ type: "response.completed", response: { id: "resp_leak", output: [] } }),
+      "data: [DONE]\n\n",
+    ].join(""),
+  });
+
+  const calls = [...functionCallsFromSse(result.clientBody).values()];
+  assert.equal(calls.length, 1, "the leaked call reaches Codex as a real tool call");
+  assert.equal(calls[0].name, "exec_command");
+  assert.deepEqual(JSON.parse(calls[0].arguments), {
+    cmd: "tail -5 .qa/eo-up.log",
+    workdir: "/tmp/eo",
+  });
+  // The markup itself never reaches the client, and the reasoning it was buried
+  // in still does.
+  assert.ok(!result.clientBody.includes("arg_key"));
+  assert.ok(!result.clientBody.includes("tool_calls:"));
+  assert.ok(result.clientBody.includes("Let me keep reading the behavior code"));
+  // The recovered call lands before the turn closes, so the blank message is
+  // labelled commentary rather than becoming the turn's final answer.
+  const blank = responseItemsFromSse(result.clientBody)
+    .filter((item) => item.type === "message" && item.id === "msg_blank")
+    .at(-1);
+  assert.equal(blank.phase, "commentary");
+});
+
+test("hy4's prior reasoning is replayed as thinking, never as its own visible prose", async () => {
+  // Rollout 01a0928e (opencode-go hy4-preview, 12 September 2026): once the
+  // model's past reasoning was replayed to it as ordinary assistant text, it
+  // stopped using the reasoning channel (174 reasoning tokens -> 0 at one
+  // step) and looped on its last progress note -- 2, 4, 5, 8, then 16 copies.
+  const history = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "why is the NPC life awkward?" }] },
+    {
+      type: "reasoning",
+      id: "rs_prior",
+      summary: [{ type: "summary_text", text: "PRIOR_THINKING: look at the locomotion code first." }],
+    },
+    {
+      type: "message",
+      role: "assistant",
+      id: "msg_prior",
+      content: [{ type: "output_text", text: "Let me read the locomotion code." }],
+    },
+    { type: "function_call", name: "exec_command", call_id: "call_prior", arguments: '{"cmd":"ls src"}' },
+    { type: "function_call_output", call_id: "call_prior", output: "pedestrians.js" },
+  ];
+  const outgoingFor = async (model) => {
+    const result = await scenario(true, {
+      model,
+      requestPayload: (stream, slug) => ({ model: slug, stream, input: history }),
+    });
+    return result.gatewayBodies[0];
+  };
+
+  // Hy4 by profile, and the same rule reached by upstream family on routes
+  // whose profiles say nothing about replay (GLM has no profile here, Kimi K3
+  // carries a sampling profile).
+  for (const slug of ["opencode-go/hy4-preview", "opencode-go/glm-5.3", "opencode-go/kimi-k3"]) {
+    const outgoing = await outgoingFor(slug);
+    const assistant = outgoing.input.find((item) => item.type === "message" && item.role === "assistant");
+    assert.ok(assistant, `${slug}: the assistant turn survives`);
+    const parts = assistant.content.map((part) => `${part.type}:${part.text}`);
+    assert.deepEqual(parts, [
+      "thinking:PRIOR_THINKING: look at the locomotion code first.",
+      "output_text:Let me read the locomotion code.",
+    ], slug);
+    assert.equal(
+      outgoing.input.some((item) => item.type === "reasoning"),
+      false,
+      `${slug}: the carried reasoning item is consumed, so it cannot also become a user message`,
+    );
+  }
+
+  // A chat route outside the contract now DROPS the prior reasoning instead of
+  // merging it as visible text. This assertion is the reverse of what it was,
+  // and the reversal is deliberate (#755).
+  //
+  // The old expectation was written to preserve context that LiteLLM would
+  // otherwise drop, and for a model that does not preserve thinking -- k2.6 is
+  // exactly that, which is why chat-reasoning.mjs leaves K2.x out of the
+  // family table -- the merge was harmless. What changed is upstream of this
+  // file: #708 widened the reasoning-lifecycle repair to every
+  // `openai`-protocol provider, so Codex now stores reasoning items on Chat
+  // resellers whose models DO think and are still outside the contract
+  // (`commandcode/qwen3.8-flash`, measured 14 September 2026). Replayed as
+  // prose those loop, and no field on the route separates them from k2.6 here
+  // -- identical requestProfile, reasoningLevels and defaultEffort -- so the
+  // channel is chosen per contract, not per model.
+  //
+  // The cost is real and was accepted rather than overlooked: a thread that
+  // switched models no longer shows the newer model the older one's thinking.
+  // For a model that does not think, that is the only case this can arise in
+  // at all, since it stores no reasoning of its own to carry.
+  const plain = await outgoingFor("opencode-go/kimi-k2.6");
+  const plainAssistant = plain.input.find((item) => item.type === "message" && item.role === "assistant");
+  assert.deepEqual(
+    plainAssistant.content.map((part) => `${part.type}:${part.text}`),
+    ["output_text:Let me read the locomotion code."],
+    "an off-contract route keeps what the model said and drops what it thought",
+  );
+  assert.equal(
+    plain.input.some((item) => item.type === "reasoning"),
+    false,
+    "the dropped reasoning must not survive as an item either",
+  );
+});
+
+// Console Go's validator rejects Codex's collaboration item by name on the two
+// Muse Contributor routes, so a delegated child died before its first token
+// (`input[5] did not match any supported type`). The handoff payload is
+// recovered first, and the route then presents it as the equivalent user
+// message; a sibling Console Go route, whose upstream accepts the item, keeps
+// the shape it was written for.
+test("Console Go Muse Contributor routes carry Codex handoffs as user messages", async () => {
+  const handoff = {
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/worker",
+    content: [
+      {
+        type: "input_text",
+        text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n",
+      },
+      { type: "encrypted_content", encrypted_content: "Synthetic delegated task." },
+    ],
+  };
+  const outgoingFor = async (model) => {
+    const result = await scenario(true, {
+      model,
+      requestPayload: (stream, slug) => ({ model: slug, stream, input: [handoff] }),
+    });
+    return result.gatewayBodies.at(-1);
+  };
+
+  const expected = {
+    type: "message",
+    role: "user",
+    content: [
+      handoff.content[0],
+      { type: "input_text", text: "Synthetic delegated task." },
+    ],
+  };
+  for (const slug of [
+    "opencode-go-responses/muse-spark-1.3-contributor",
+    "opencode-go-responses/muse-spark-1.2-contributor",
+  ]) {
+    assert.deepEqual((await outgoingFor(slug)).input, [expected], slug);
+  }
+  assert.deepEqual(
+    (await outgoingFor("opencode-go-responses/gpt-5.6-luna")).input,
+    [{ ...handoff, content: expected.content }],
+    "an untouched Console Go route keeps the collaboration item",
   );
 });
