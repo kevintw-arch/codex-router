@@ -2342,14 +2342,151 @@ test("Wethink turns wait behind the configured in-flight limit instead of hittin
     assert.equal(JSON.parse(overflow.body).error.code, "ERR_PROVIDER_QUEUE_FULL");
     assert.equal(calls, 1, "queued turns must not reach the upstream before a slot is released");
 
+    // 人工保留名額以獨立驗證：第二筆的等待必須歸入 admission，不能誤算上游。
+    await new Promise((resolve) => setTimeout(resolve, 150));
     releaseFirst();
     const [firstResult, secondResult] = await Promise.all([first, second]);
     assert.equal(firstResult.status, 200, firstResult.body);
     assert.equal(secondResult.status, 200, secondResult.body);
     assert.equal(calls, 2);
     assert.equal(peak, 1, "the upstream must never exceed the configured in-flight limit");
+    const events = await waitForUsageEvents(child.stateDir, 3, child);
+    const completed = events.filter((event) => event.status === 200);
+    assert.equal(completed.length, 2);
+    for (const event of completed) {
+      for (const field of ["admissionWaitMs", "requestBuildMs", "upstreamHeadersWaitMs"]) {
+        assert.ok(Number.isFinite(event[field]) && event[field] >= 0, field);
+      }
+    }
+    const queuedEvent = completed.at(-1);
+    assert.ok(queuedEvent.admissionWaitMs >= 120, "排隊等待必須持久化");
+    assert.ok(queuedEvent.admissionWaitMs > queuedEvent.upstreamHeadersWaitMs,
+      "排隊時間不可錯誤歸因為上游標頭等待");
+    const rejected = events.find((event) => event.status === 503);
+    assert.ok(Number.isFinite(rejected.admissionWaitMs));
+    assert.equal("requestBuildMs" in rejected, false);
+    assert.equal("upstreamHeadersWaitMs" in rejected, false);
   } finally {
     releaseFirst();
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("Wethink retries one short Retry-After rate limit before returning a turn error", async () => {
+  let calls = 0;
+  const gw = await gateway(async (request, response) => {
+    await bodyJson(request);
+    calls += 1;
+    if (calls === 1) {
+      const payload = Buffer.from(JSON.stringify({
+        error: { message: "Too many requests; retry after a short delay", type: "rate_limit_error" },
+      }), "utf8");
+      response.writeHead(429, {
+        "Content-Type": "application/json",
+        "Content-Length": String(payload.length),
+        "Retry-After": "1",
+      });
+      response.end(payload);
+      return;
+    }
+    const payload = Buffer.from(contentSse("recovered-after-rate-limit"), "utf8");
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const model = userModelEntry({
+    providerId: "wethink",
+    upstreamId: "short-rate-limit-fixture",
+    priority: 900,
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [],
+    enabled: false,
+    userModels: [model],
+    genericProviders: [{
+      id: "wethink",
+      displayName: "Wethink rate-limit fixture",
+      baseUrl: "https://wethink.example.test/v1",
+      adapter: "openai-chat",
+      headers: {},
+      allowPrivate: false,
+      enabled: true,
+    }],
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const startedAt = Date.now();
+    const result = await readRouted(routerPort, {
+      model: model.slug,
+      input: "wait rather than fail",
+      stream: true,
+    });
+    assert.equal(result.status, 200, result.body);
+    assert.match(result.body, /recovered-after-rate-limit/);
+    assert.equal(calls, 2, "the exact turn should be replayed once after Retry-After");
+    assert.ok(Date.now() - startedAt >= 900, "the router must honor the one-second Retry-After");
+    assert.match(child.testErrors(), /Wethink short rate limit; waiting before one replay/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("Wethink never replays a short Retry-After quota-exhaustion response", async () => {
+  let calls = 0;
+  const gw = await gateway(async (request, response) => {
+    await bodyJson(request);
+    calls += 1;
+    const payload = Buffer.from(JSON.stringify({
+      error: {
+        message: "You exceeded your current quota, please check your plan and billing details.",
+        type: "insufficient_quota",
+      },
+    }), "utf8");
+    response.writeHead(429, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+      "Retry-After": "1",
+    });
+    response.end(payload);
+  });
+  const model = userModelEntry({
+    providerId: "wethink",
+    upstreamId: "quota-rate-limit-fixture",
+    priority: 900,
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [],
+    enabled: false,
+    userModels: [model],
+    genericProviders: [{
+      id: "wethink",
+      displayName: "Wethink quota fixture",
+      baseUrl: "https://wethink.example.test/v1",
+      adapter: "openai-chat",
+      headers: {},
+      allowPrivate: false,
+      enabled: true,
+    }],
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const startedAt = Date.now();
+    const result = await readRouted(routerPort, {
+      model: model.slug,
+      input: "do not replay exhausted usage",
+      stream: true,
+    });
+    assert.equal(result.status, 429, result.body);
+    assert.equal(calls, 1, "a quota-exhaustion response must not be replayed");
+    assert.ok(Date.now() - startedAt < 900, "quota exhaustion must not wait out a short hint");
+    assert.doesNotMatch(child.testErrors(), /Wethink short rate limit; waiting before one replay/);
+  } finally {
     await stopChild(child);
     await closeServer(gw.server);
   }

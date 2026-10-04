@@ -222,7 +222,7 @@ export async function refreshTargetPickerIfInstalled({ signal, deadline } = {}) 
   // user's settings document: it records that this router published there, and
   // it survives a user who edits or moves the document by hand.
   if (existsSync(DSH_CATALOG_PATH)) {
-    await runTargetPublicationProcess("dsh-config-manager.mjs", ["install"], {
+    await runTargetPublicationProcess("dsh-config-manager.mjs", ["refresh-picker"], {
       signal,
       deadline: operationDeadline,
     });

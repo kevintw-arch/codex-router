@@ -1,0 +1,1 @@
+- **支援 WT TensorFold 工具往返。** 僅對 WT GLM 與 Qwen 使用既有可逆 function-tool 橋接、移除未支援的環境預設 hosted search，並提供有界限的長輸入等待預算；保留其他供應商原生行為。

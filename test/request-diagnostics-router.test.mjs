@@ -205,6 +205,9 @@ test("Grok 4.6 usage rows correlate with activity id across success, failure, an
     assert.equal(success.reasoningTokens, 3);
     assert.equal(success.inputTokens, 11);
     assert.equal(success.outputTokens, 4);
+    for (const field of ["admissionWaitMs", "requestBuildMs", "upstreamHeadersWaitMs"]) {
+      assert.ok(Number.isFinite(success[field]) && success[field] >= 0, field);
+    }
     assert.match(success.requestId, /^[a-f0-9-]+:[0-9]+$/);
     const completedActivity = await (await fetch(`${routerBase(routerPort)}/activity`)).json();
     assert.ok(completedActivity.recent.some((entry) => entry.requestId === success.requestId && entry.status === 200));
@@ -226,6 +229,9 @@ test("Grok 4.6 usage rows correlate with activity id across success, failure, an
     assert.ok(failedActivity.recent.some((entry) => entry.requestId === failure.requestId && entry.status === 502));
     assert.deepEqual(failure.contextBytes, EXPECTED_CONTEXT);
     assert.equal("reasoningTokens" in failure, false);
+    for (const field of ["admissionWaitMs", "requestBuildMs", "upstreamHeadersWaitMs"]) {
+      assert.ok(Number.isFinite(failure[field]) && failure[field] >= 0, field);
+    }
 
     const canceler = new AbortController();
     const held = fetch(`${routerBase(routerPort)}/responses`, {

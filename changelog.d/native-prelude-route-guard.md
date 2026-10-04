@@ -1,0 +1,1 @@
+- Fix native OpenAI Responses requests returning local 502 after upstream success when computing the routed prelude budget without a routed model.

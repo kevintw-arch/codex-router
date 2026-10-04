@@ -7,6 +7,8 @@ import test from "node:test";
 const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-targets-"));
 process.env.CODEX_HOME = path.join(testRoot, "codex");
 process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
+// 正式環境可能帶有較高優先的 override；測試不得沿用它。
+process.env.MODEL_ROUTER_STATE_DIR = path.join(testRoot, "state");
 
 const {
   installedTargets,

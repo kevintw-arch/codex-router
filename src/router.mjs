@@ -55,8 +55,10 @@ import {
   EmptyCompletionGuard,
   EmptyCompletionTerminalGuard,
   isEmptyCompletionPreludeLimitError,
-  preludeBudgetMs,
 } from "./empty-completion-guard.mjs";
+import { isWethinkTensorFold, routedPreludeBudgetMs } from "./wethink-tensorfold-compat.mjs";
+import { glmToolOrder } from "./wethink-glm-tool-order.mjs";
+import { createRequestStageTiming } from "./request-stage-timing.mjs";
 import { itemLifecycleNormalizerTransform } from "./item-lifecycle-normalizer.mjs";
 import {
   leakedToolCallRecoveryTransform,
@@ -149,7 +151,7 @@ import {
   isRemoteCompactV2Trigger,
   skippableCompactionTokens,
 } from "./compaction-limit.mjs";
-import { fetchWithRetry } from "./upstream-retry.mjs";
+import { fetchWithRetry, sleep } from "./upstream-retry.mjs";
 import { repairGeminiToolSchemas } from "./gemini-tool-schema.mjs";
 import { applyGrokApplyPatchGuidance } from "./grok-apply-patch-guidance.mjs";
 import { GROK_OAUTH_PROVIDER, isGrokOauthAgenticRoute } from "./grok-oauth-routes.mjs";
@@ -523,6 +525,23 @@ function providerConcurrencyPayload() {
     },
   };
 }
+
+const MAX_WETHINK_RETRY_AFTER_SECONDS = 60;
+
+function pauseWethinkQueueOnRateLimit(route, status, headers) {
+  if (
+    canonicalProviderId(route?.provider) !== "wethink" ||
+    Number(status) !== 429
+  ) return undefined;
+  const seconds = retryAfterSeconds(headers);
+  if (
+    !Number.isFinite(seconds) ||
+    seconds <= 0 ||
+    seconds > MAX_WETHINK_RETRY_AFTER_SECONDS
+  ) return undefined;
+  wethinkAdmissionQueue.pauseFor(Math.ceil(seconds * 1_000));
+  return seconds;
+}
 // This bounds only the tray's activity records. It must not cancel an operation
 // or release its admission slot: a healthy SSE turn can outlive presentation
 // bookkeeping and still retain real buffers and an upstream connection.
@@ -766,6 +785,7 @@ function recordObservedUsage(fields, diagnostics) {
   recordUsageEvent({
     ...fields,
     ...usageDiagnosticMetadata(diagnostics),
+    ...(diagnostics?.stageTiming?.snapshot() ?? {}),
   });
 }
 
@@ -1146,7 +1166,8 @@ function normalizeAutoToolChoice(payload, route) {
 function routedSearchCompatibility(payload, route) {
   const searchMode = routedModelSearchMode(route);
   const provider = providerForModel(route);
-  const compatiblePayload = provider?.generic !== true || searchMode !== undefined
+  const wtTensorFold = isWethinkTensorFold(route, provider);
+  const compatiblePayload = (provider?.generic !== true && !wtTensorFold) || searchMode !== undefined
     ? payload
     : stripUnsupportedHostedSearch(payload, { model: route.slug });
   return { payload: compatiblePayload, searchMode };
@@ -1212,10 +1233,16 @@ function needsZenFreeToolCompatibility(route) {
 // Console Go's Responses endpoint is Responses-shaped but implements only the
 // ordinary function-tool subset: namespace/custom/deferred-search controls are
 // rejected, as are function names over 64 characters. Keep this exact to the
-// Go Responses variant; paid Zen and other Responses providers retain their
-// native contract until their own upstream proves otherwise.
+// Go Responses variant and the two measured WeThink TensorFold routes; paid
+// Zen and other Responses providers retain their native contract until their
+// own upstream proves otherwise. WeThink's GLM/Qwen routes also reject custom
+// tools and require the same reversible function-tool bridge.
 function needsConsoleGoResponsesToolCompatibility(route) {
-  return providerForModel(route)?.id === "opencode-go-responses";
+  const provider = providerForModel(route);
+  return (
+    provider?.id === "opencode-go-responses" ||
+    isWethinkTensorFold(route, provider)
+  );
 }
 
 function rejectsWebSearchOptions(route) {
@@ -4216,6 +4243,15 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     delete routed.reasoning_effort;
   }
   if (rejectsWebSearchOptions(route)) delete routed.web_search_options;
+  // 轉接完成後才排列；不改 alias、schema、歷史或 materialized retry bytes。
+  const orderedTools = process.env.CODEX_ROUTER_GLM_STABLE_TOOL_ORDER === "1" ? glmToolOrder.arrange({
+    tools: routed.tools, route, provider,
+    threadId: threadIdFromHeaders(request.headers),
+  }) : routed.tools;
+  if (orderedTools !== routed.tools) {
+    console.error(`[codex-router] GLM 工具順序穩定化：保留 ${orderedTools.length} 個工具。`);
+    routed.tools = orderedTools;
+  }
   const usageDiagnostics = {
     reasoningEffort:
       routed.reasoning?.effort ??
@@ -4264,23 +4300,27 @@ async function prepareRoutedRequest({
   normalizedInput,
   agingEnabled,
   imageLimits,
+  stageTiming,
 }) {
-  const prepared = prepareProviderInput(normalizedInput, route, {
-    agingEnabled,
-    imageLimits,
-  });
-  const built = await buildRoutedRequest({
-    request,
-    payload,
-    route,
-    agedInput: prepared.input,
-  });
-  return {
-    ...built,
-    agedInput: prepared.input,
-    toolResultAging: prepared.toolResultAging,
-    imageBudget: prepared.imageBudget,
+  const prepare = async () => {
+    const prepared = prepareProviderInput(normalizedInput, route, {
+      agingEnabled,
+      imageLimits,
+    });
+    const built = await buildRoutedRequest({
+      request,
+      payload,
+      route,
+      agedInput: prepared.input,
+    });
+    return {
+      ...built,
+      agedInput: prepared.input,
+      toolResultAging: prepared.toolResultAging,
+      imageBudget: prepared.imageBudget,
+    };
   };
+  return stageTiming ? stageTiming.measure("requestBuildMs", prepare) : prepare();
 }
 
 // The one place a conversation is reduced before it leaves for a provider.
@@ -4439,6 +4479,7 @@ async function attemptModelFailover({
   agingEnabled,
   searchContract,
   progress,
+  stageTiming,
 }) {
   const settings = readFailoverSettings();
   if (!settings.enabled) return undefined;
@@ -4481,6 +4522,7 @@ async function attemptModelFailover({
         route: model,
         normalizedInput,
         agingEnabled,
+        stageTiming,
       });
       if (!routedRequestFits(model, built.body)) {
         logFailover(route, model, verdict.reason, status, "context-too-small");
@@ -4497,12 +4539,15 @@ async function attemptModelFailover({
       // `/activity` must not credit that wait to the provider that failed.
       progress?.setRoute({ provider: canonicalProviderId(model.provider), model: model.slug });
       progress?.attempt();
-      upstream = await fetchForRoute(model, built.target, {
+      const fetchCandidate = () => fetchForRoute(model, built.target, {
         method: "POST",
         headers: built.headers,
         body: built.body,
         signal,
       });
+      upstream = stageTiming
+        ? await stageTiming.measure("upstreamHeadersWaitMs", fetchCandidate)
+        : await fetchCandidate();
       progress?.headers();
     } catch (error) {
       if (signal.aborted) throw error;
@@ -4567,15 +4612,17 @@ function writeIdleNoProviderError(response) {
 
 async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
+  const stageTiming = createRequestStageTiming();
   const controller = new AbortController();
   const activity = beginRequestActivity({ request, response, controller });
   const fetchObservedUpstream = async (url, init) => {
     activity.progress.attempt();
-    const upstream = await fetchForRoute(route, url, init);
+    const upstream = await stageTiming.measure("upstreamHeadersWaitMs", () =>
+      fetchForRoute(route, url, init));
     activity.progress.headers();
     return upstream;
   };
-  const diagnostics = { requestId: activity.requestId };
+  const diagnostics = { requestId: activity.requestId, stageTiming };
   let clientGone = false;
   let requestedModel = "";
   let route;
@@ -4740,11 +4787,11 @@ async function handleResponses(request, response, requestUrl) {
       // Hold the slot across compaction, the primary upstream request, and a
       // possible empty-completion retry. This is one logical turn, and the
       // DGX runtime's MAX_NUM_SEQS applies to that whole turn.
-      releaseProviderSlot = await acquireProviderSlot(route.provider, {
+      releaseProviderSlot = await stageTiming.measure("admissionWaitMs", () => acquireProviderSlot(route.provider, {
         priority: compactV1 || compactV2,
         signal: controller.signal,
         weightBytes: body.byteLength,
-      });
+      }));
     }
 
     // The same normalization the routed compaction path would do, hoisted so
@@ -4888,11 +4935,11 @@ async function handleResponses(request, response, requestUrl) {
       // not reintroduce ambient search that this route never advertised.
       const searchSnapshot = snapshotRoutedSearch(payload, route);
       payload = searchSnapshot.payload;
-      normalizedInput = await normalizeRoutedAgentInput(
+      normalizedInput = await stageTiming.measure("requestBuildMs", () => normalizeRoutedAgentInput(
         request,
         payload.input,
         controller.signal,
-      );
+      ));
       searchContract = routedSearchContract(searchSnapshot, normalizedInput);
       agingEnabled = toolResultAgingEnabled();
       const built = await prepareRoutedRequest({
@@ -4901,6 +4948,7 @@ async function handleResponses(request, response, requestUrl) {
         route,
         normalizedInput,
         agingEnabled,
+        stageTiming,
       });
       toolResultAging = built.toolResultAging;
       imageBudget = built.imageBudget;
@@ -4941,6 +4989,7 @@ async function handleResponses(request, response, requestUrl) {
               route: next.model,
               normalizedInput,
               agingEnabled,
+              stageTiming,
             });
           } catch (error) {
             const compatibilityCode = candidateBuildCompatibilityCode(error);
@@ -5082,11 +5131,8 @@ async function handleResponses(request, response, requestUrl) {
     );
     upstreamRetries = retries;
     upstreamStatus = upstream.status;
-    // Time until the upstream chain answered the request. Everything before
-    // this is router-side work (body read, normalization, flattening, vision
-    // bridge) plus the upstream's own time to produce response headers. For a
-    // routed turn that means the full router -> litellm -> api-forwarder ->
-    // provider path, so a stall here is the provider's, not the router's.
+    // 目前採用嘗試取得標頭時，相對請求開始的時間：含讀取、排隊、組裝與上游等待。
+    // 不能將這個總值全歸因於供應商；三個階段欄位另記已量測操作的累計。
     upstreamLatencyMs = Date.now() - startedAt;
     // The body of a failed routed attempt, read once: the failover classifier
     // and the error translation below both need it, and it can only be read
@@ -5103,6 +5149,54 @@ async function handleResponses(request, response, requestUrl) {
         bodyText: failedBodyText,
         retryAfterSeconds: retryAfterSeconds(upstream.headers),
       });
+      const rateLimitWaitSeconds = pauseWethinkQueueOnRateLimit(
+        route,
+        upstream.status,
+        upstream.headers,
+      );
+      // A short Retry-After from the Wethink endpoint is a pacing signal, not
+      // a reason to make Codex spend its reconnect budget. Keep the current
+      // provider slot, pause later Wethink admissions, and replay the exact
+      // materialized request once only when the gateway classified the 429 as
+      // rate limiting rather than exhausted usage. No caller bytes have been
+      // sent at this point, so the rejected attempt cannot duplicate a stream.
+      if (
+        rateLimitWaitSeconds !== undefined &&
+        verdict.reason !== "out_of_usage" &&
+        nothingRelayed(response) &&
+        !controller.signal.aborted
+      ) {
+        const waitMs = Math.ceil(rateLimitWaitSeconds * 1_000);
+        console.error(
+          `[codex-router] Wethink short rate limit; waiting before one replay model=${route.slug} wait_ms=${waitMs}`,
+        );
+        await sleep(waitMs, controller.signal);
+        controller.signal.throwIfAborted();
+        upstream = await fetchObservedUpstream(target, {
+          method: "POST",
+          headers,
+          body: routedBody,
+          signal: controller.signal,
+        });
+        upstreamRetries = (upstreamRetries || 0) + 1;
+        upstreamStatus = upstream.status;
+        upstreamLatencyMs = Date.now() - startedAt;
+        failedBodyText = upstream.ok
+          ? undefined
+          : await boundedResponseText(
+              upstream,
+              MAX_BUFFERED_RESPONSE_BYTES,
+              controller.signal,
+            );
+        verdict = upstream.ok
+          ? { swap: false }
+          : classifyRoutedFailure({
+              status: upstream.status,
+              bodyText: failedBodyText,
+              retryAfterSeconds: retryAfterSeconds(upstream.headers),
+            });
+        pauseWethinkQueueOnRateLimit(route, upstream.status, upstream.headers);
+      }
       // The provider forwarder emits the reserved transport marker only when
       // it failed before any provider response was available. Cross-model
       // failover already treats that marker as replay-safe, but an ordinary
@@ -5164,6 +5258,7 @@ async function handleResponses(request, response, requestUrl) {
           normalizedInput,
           agingEnabled,
           imageLimits,
+          stageTiming,
         }));
         logImageRejectionRetry(route, requestUrl.pathname, attempt, imageBudget);
         upstream = await fetchObservedUpstream(target, {
@@ -5197,6 +5292,7 @@ async function handleResponses(request, response, requestUrl) {
         recordProviderCooldown(route.provider, verdict);
         const moved = await attemptModelFailover({
           progress: activity.progress,
+          stageTiming,
           request,
           response,
           payload,
@@ -5501,7 +5597,7 @@ async function handleResponses(request, response, requestUrl) {
     // prompt's prefill is legitimately longer than a small one's, and a flat
     // budget turns that into a stated "empty completion" (measured 2026-09-21
     // on a ~577k-token turn).
-    const requestPreludeMs = preludeBudgetMs({
+    const requestPreludeMs = routedPreludeBudgetMs(route, route ? providerForModel(route) : undefined, {
       baseMs: EMPTY_COMPLETION_PRELUDE_MS,
       requestBytes: typeof body?.length === "number" ? body.length : 0,
     });

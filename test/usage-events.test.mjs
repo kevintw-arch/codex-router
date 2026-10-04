@@ -8,6 +8,54 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+test("階段耗時持久化保留零值、缺值與數值界限，並拒絕其他內容", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-stage-timing-"));
+  try {
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+      import assert from "node:assert/strict";
+      import { appendFileSync, readFileSync } from "node:fs";
+      const usage = await import("./src/usage-events.mjs");
+      const base = { model: "wethink/stage-timing-test", provider: "wethink", durationMs: 321 };
+      usage.recordUsageEvent({ ...base, status: 200,
+        admissionWaitMs: 0, requestBuildMs: 2.6, upstreamHeadersWaitMs: 1e99,
+        prompt: "不得持久化的測試內容", credential: "不得持久化的測試憑證" });
+      usage.recordUsageEvent({ ...base, status: 201,
+        admissionWaitMs: "7", requestBuildMs: null, upstreamHeadersWaitMs: true });
+      usage.recordUsageEvent({ ...base, status: 202 });
+      usage.recordUsageEvent({ ...base, status: 203,
+        admissionWaitMs: -1, requestBuildMs: Infinity, upstreamHeadersWaitMs: NaN });
+      const raw = readFileSync(usage.USAGE_EVENTS_PATH, "utf8");
+      assert.equal(raw.includes("不得持久化"), false);
+      const persisted = raw.trim().split("\\n").map(JSON.parse);
+      assert.equal(persisted[0].admissionWaitMs, 0);
+      assert.equal(persisted[0].requestBuildMs, 3);
+      assert.equal(persisted[0].upstreamHeadersWaitMs, Number.MAX_SAFE_INTEGER);
+      for (const event of persisted.slice(1)) {
+        for (const field of ["admissionWaitMs", "requestBuildMs", "upstreamHeadersWaitMs"])
+          assert.equal(field in event, false);
+      }
+      // 直接建立損壞的歷史列，獨立驗證讀取白名單，而非只驗證寫入器。
+      appendFileSync(usage.USAGE_EVENTS_PATH, JSON.stringify({ ...base,
+        at: new Date().toISOString(), status: 204,
+        admissionWaitMs: "7", requestBuildMs: false, upstreamHeadersWaitMs: -1 }) + "\\n");
+      for (const read of [usage.recentUsageEvents, usage.allUsageEvents]) {
+        const events = read();
+        const measured = events.find(event => event.status === 200);
+        assert.equal(measured.admissionWaitMs, 0);
+        assert.equal(measured.requestBuildMs, 3);
+        assert.equal(measured.upstreamHeadersWaitMs, Number.MAX_SAFE_INTEGER);
+        for (const event of events.filter(event => event.status !== 200)) {
+          for (const field of ["admissionWaitMs", "requestBuildMs", "upstreamHeadersWaitMs"])
+            assert.equal(field in event, false);
+        }
+      }
+    `], { cwd: root, env: { ...process.env, MODEL_ROUTER_STATE_DIR: stateDir }, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("usage events persist only bounded request metadata in a private file", async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
   const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
@@ -20,6 +68,9 @@ test("usage events persist only bounded request metadata in a private file", asy
       status: 200,
       durationMs: 321,
       responseStartMs: 121,
+      admissionWaitMs: 117,
+      requestBuildMs: 2,
+      upstreamHeadersWaitMs: 2,
       inputTokens: 120,
       billedInputTokens: 240,
       cachedInputTokens: 90,
@@ -48,6 +99,9 @@ test("usage events persist only bounded request metadata in a private file", asy
         status: 200,
         durationMs: 321,
         responseStartMs: 121,
+        admissionWaitMs: 117,
+        requestBuildMs: 2,
+        upstreamHeadersWaitMs: 2,
         inputTokens: 120,
         billedInputTokens: 240,
         cachedInputTokens: 90,

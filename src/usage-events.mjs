@@ -12,6 +12,7 @@ import { STATE_DIR } from "./paths.mjs";
 import { canonicalProviderId } from "./provider-selection.mjs";
 import { acceptedInputTokens } from "./context-window-drift.mjs";
 import { serviceTierMetadata, usageDiagnosticMetadata } from "./request-diagnostics.mjs";
+import { sanitizeRequestStageTiming } from "./request-stage-timing.mjs";
 
 export const USAGE_EVENTS_PATH = path.join(STATE_DIR, "usage-events.jsonl");
 
@@ -80,6 +81,11 @@ export function recordUsageEvent({
   // generation phase from prompt processing, queueing, and router setup.
   // Historical rows omit it and must not be used for generation-rate math.
   responseStartMs,
+  // 各階段的操作耗時累計，包含失敗嘗試；未量測不補零。
+  // admission 僅量 acquire；build 含正規化與建構；headers 僅量 fetch。
+  admissionWaitMs,
+  requestBuildMs,
+  upstreamHeadersWaitMs,
   // Milliseconds from receiving the request until the first generated token
   // reached the client. This -- not responseStartMs -- is the split an
   // output-tokens-per-second figure divides by, matching how the industry
@@ -228,6 +234,7 @@ export function recordUsageEvent({
     ...(safeTokenCount(firstTokenMs) !== undefined
       ? { firstTokenMs: safeTokenCount(firstTokenMs) }
       : {}),
+    ...sanitizeRequestStageTiming({ admissionWaitMs, requestBuildMs, upstreamHeadersWaitMs }),
     ...(typeof reasoningStreamed === "boolean" ? { reasoningStreamed } : {}),
     ...(streamAborted === true ? { streamAborted: true } : {}),
     ...(emptyCompletion === true ? { emptyCompletion: true } : {}),
@@ -566,6 +573,7 @@ export function recentUsageEvents({
           ...(safeTokenCount(event.firstTokenMs) !== undefined
             ? { firstTokenMs: safeTokenCount(event.firstTokenMs) }
             : {}),
+          ...sanitizeRequestStageTiming(event),
           ...(typeof event.reasoningStreamed === "boolean"
             ? { reasoningStreamed: event.reasoningStreamed }
             : {}),

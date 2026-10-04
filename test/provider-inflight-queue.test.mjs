@@ -42,6 +42,33 @@ test("ordinary requests wait in FIFO order without exceeding active capacity", a
   assert.equal(queue.snapshot().active, 0);
 });
 
+test("a provider Retry-After pause holds queued requests until the cooldown expires", async () => {
+  const queue = createProviderInflightQueue({
+    provider: "wethink",
+    maxActive: 1,
+    maxQueued: 2,
+    maxQueuedBytes: 1_000,
+    queueTimeoutMs: 1_000,
+  });
+  const releaseFirst = await queue.acquire();
+  let admittedAt;
+  const waiting = queue.acquire().then((release) => {
+    admittedAt = Date.now();
+    return release;
+  });
+  const pausedUntil = queue.pauseFor(100);
+
+  assert.ok(queue.snapshot().pausedUntil >= pausedUntil);
+  releaseFirst();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(admittedAt, undefined, "the waiter must not start during Retry-After");
+
+  const releaseWaiting = await waiting;
+  assert.ok(admittedAt >= pausedUntil, "the waiter should start only after the pause");
+  releaseWaiting();
+  assert.equal(queue.snapshot().active, 0);
+});
+
 test("the waiting limit returns a bounded service-unavailable error", async () => {
   const queue = createProviderInflightQueue({
     provider: "wethink",

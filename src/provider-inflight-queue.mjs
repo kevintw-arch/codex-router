@@ -60,6 +60,8 @@ export function createProviderInflightQueue({
 
   let active = 0;
   let queuedBytes = 0;
+  let pausedUntil = 0;
+  let pauseTimer;
   const waiting = [];
 
   function releaseFactory() {
@@ -87,11 +89,13 @@ export function createProviderInflightQueue({
   }
 
   function nextEligibleIndex() {
+    if (Date.now() < pausedUntil) return -1;
     if (active >= maxActive) return -1;
     return waiting.length ? 0 : -1;
   }
 
   function drain() {
+    if (Date.now() < pausedUntil) return;
     for (;;) {
       const index = nextEligibleIndex();
       if (index < 0) return;
@@ -115,7 +119,7 @@ export function createProviderInflightQueue({
 
     // Priority compaction can jump ordinary waiters, but never exceeds the
     // provider's proven active-request limit.
-    if (!waiting.length && active < maxActive) {
+    if (Date.now() >= pausedUntil && !waiting.length && active < maxActive) {
       active += 1;
       return Promise.resolve(releaseFactory());
     }
@@ -185,13 +189,27 @@ export function createProviderInflightQueue({
     });
   }
 
+  function pauseFor(delayMs) {
+    const delay = Number(delayMs);
+    if (!Number.isFinite(delay) || delay <= 0) return pausedUntil;
+    pausedUntil = Math.max(pausedUntil, Date.now() + Math.ceil(delay));
+    clearTimeout(pauseTimer);
+    pauseTimer = setTimeout(() => {
+      pauseTimer = undefined;
+      drain();
+    }, Math.max(0, pausedUntil - Date.now()));
+    return pausedUntil;
+  }
+
   return {
     acquire,
+    pauseFor,
     snapshot() {
       return {
         active,
         queued: waiting.length,
         queuedBytes,
+        ...(pausedUntil > Date.now() ? { pausedUntil } : {}),
         maxActive,
         maxQueued,
         maxQueuedBytes,

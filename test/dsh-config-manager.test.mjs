@@ -10,6 +10,7 @@ import { buildDshRoute } from "../src/dsh-catalog.mjs";
 import {
   applyCredential,
   applyDefaultModel,
+  applyPickerToSettings,
   applyRouteToSettings,
   removeCredential,
   removeRouteFromSettings,
@@ -91,6 +92,18 @@ test("an apostrophe elsewhere in the document does not move the route", () => {
 test("publishing twice is byte-identical", () => {
   const once = applyRouteToSettings(USER_SETTINGS, ROUTE);
   assert.equal(applyRouteToSettings(once, ROUTE), once);
+});
+
+test("picker refresh preserves all non-model settings and is idempotent", () => {
+  const before = applyRouteToSettings(USER_SETTINGS, ROUTE);
+  const models = [{ id: "replacement/model", name: "新模型" }];
+  const after = applyPickerToSettings(before, models);
+  assert.ok(after.includes('id: "replacement/model"'));
+  assert.ok(!after.includes('id: "vendor/model"'));
+  assert.equal(removeRouteFromSettings(after), USER_SETTINGS);
+  assert.ok(after.includes(`baseURL: "${BASE_URL}"`));
+  assert.equal(applyPickerToSettings(after, models), after);
+  assert.throws(() => applyPickerToSettings(USER_SETTINGS, models), /installed router models block/);
 });
 
 test("removing the route restores the document exactly", () => {
@@ -482,6 +495,38 @@ function manage(command, { dshHome, stateDir }) {
   );
   return JSON.parse(output);
 }
+
+test("picker refresh never edits nested harness credentials or the chosen default", () => {
+  const box = sandbox();
+  try {
+    manage("install --set-default-model", box);
+    const credentialsPath = path.join(box.dshHome, ".credentials.yaml");
+    const credentials = 'version: 2\nrecords:\n  private-provider:\n    secret: untouched\n';
+    writeFileSync(credentialsPath, credentials, { mode: 0o600 });
+    const credentialStat = statSync(credentialsPath);
+    const settingsPath = path.join(box.dshHome, "settings.yaml");
+    const before = readFileSync(settingsPath, "utf8");
+    const snapshotPath = path.join(box.stateDir, "dsh-models.json");
+    const oldSnapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+    const hidden = oldSnapshot.models[0];
+    writeFileSync(path.join(box.stateDir, "model-picker.json"), JSON.stringify({
+      version: 1, hidden: [hidden], visible: oldSnapshot.models.filter((m) => m !== hidden),
+    }));
+    const result = manage("refresh-picker", box);
+    assert.equal(result.credentialsChanged, false);
+    assert.equal(readFileSync(credentialsPath, "utf8"), credentials);
+    assert.equal(statSync(credentialsPath).mtimeMs, credentialStat.mtimeMs);
+    assert.equal(statSync(credentialsPath).ino, credentialStat.ino);
+    const after = readFileSync(settingsPath, "utf8");
+    assert.ok(!after.includes(`id: "${hidden}"`));
+    assert.ok(!JSON.parse(readFileSync(snapshotPath, "utf8")).models.includes(hidden));
+    assert.equal(removeRouteFromSettings(after), removeRouteFromSettings(before));
+    assert.throws(() => applyCredential(credentials, "CODEX_ROUTER_CALLER_KEY", "test"), /nested mapping/);
+  } finally {
+    rmSync(box.dshHome, { recursive: true, force: true });
+    rmSync(box.stateDir, { recursive: true, force: true });
+  }
+});
 
 test("install writes both documents owner-only, and uninstall takes them back out", () => {
   const box = sandbox();

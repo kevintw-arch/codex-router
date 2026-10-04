@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "wethink",
+      "displayName": "WeThink LiteLLM",
+      "kind": "openai-compatible",
+      "ownedBy": "wethink",
+      "protocol": "openai-responses",
+      "baseUrl": "https://ai.wethink.tw/codex/v1",
+      "baseUrlEnv": "WETHINK_LITELLM_BASE_URL",
+      "authoritativeModelCatalog": true,
+      "credential": {
+        "environment": [
+          "WETHINK_LITELLM_API_KEY"
+        ],
+        "file": "wethink-litellm-api-key.secret",
+        "legacyFiles": [],
+        "keychainServices": [
+          "codex-router-wethink"
+        ],
+        "prompt": "WeThink LiteLLM scoped key"
+      },
+      "planNote": "Provider credentials, routing, policy, and Spend are centrally managed by WeThink LiteLLM."
+    }
+  ]
+}

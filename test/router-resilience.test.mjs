@@ -479,7 +479,8 @@ test("same encrypted payload shares one relay and expiry removes the retained pl
     "Content-Type": "application/json",
   };
   try {
-    await waitFor(`http://127.0.0.1:${routerPort}/health`, router);
+    // 驗證受保護的 Router 路徑，不能把同埠的其他健康端點當成已就緒。
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
     const firstPending = fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/responses`, {
       method: "POST",
       headers,
@@ -492,6 +493,13 @@ test("same encrypted payload shares one relay and expiry removes the retained pl
     });
     await Promise.race([
       gatewayRequestsStarted,
+      ...[firstPending, secondPending].map((pending) => pending.then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`測試請求被提前拒絕 (${response.status}): ${await response.text()}`);
+        }
+        // 成功回應仍由下方讀取；不能搶先消耗其內容或代替兩筆抵達的條件。
+        return new Promise(() => {});
+      })),
       new Promise((_, reject) => {
         const timer = setTimeout(
           () => reject(new Error(`Timed out waiting for routed payloads: ${router.testErrors()}`)),

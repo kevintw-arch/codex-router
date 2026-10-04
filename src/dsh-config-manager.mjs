@@ -144,6 +144,20 @@ export function applyRouteToSettings(contents, route) {
   return joinLines(normalizeTrailing(spliceYamlBlock(document, ROUTE_PATH, rendered)));
 }
 
+// 更新選單只替換既有路由的 models；不重新安裝路由或處理憑證。
+export function applyPickerToSettings(contents, models) {
+  const document = scanYamlDocument(contents);
+  const route = yamlNode(document, ROUTE_PATH);
+  const modelNode = yamlNode(document, [...ROUTE_PATH, "models"]);
+  if (!route || route.inline || !modelNode) {
+    throw new Error("Cannot refresh the DSH picker without an installed router models block.");
+  }
+  const rendered = renderDshRouteLines({ models }, { indent: " ".repeat(route.indent) });
+  const lines = [...document.lines];
+  lines.splice(modelNode.index, modelNode.endIndex - modelNode.index + 1, ...rendered.slice(1));
+  return lines.join("\n");
+}
+
 /**
  * Removes the router's route, leaving every sibling route in place.
  *
@@ -469,6 +483,25 @@ export function install({ setDefaultModel = false } = {}) {
   };
 }
 
+export function refreshPicker() {
+  assertStateOwnership("refresh the DeepSeek Harness model picker");
+  // 已安裝路由由下方結構檢查核驗；遺失的衍生快照可以重建，不重裝憑證。
+  const published = existsSync(DSH_CATALOG_PATH)
+    ? JSON.parse(readDocument(DSH_CATALOG_PATH))
+    : { version: 1, route: DSH_ROUTE_ID };
+  const { models, engine } = dshRoutedModels();
+  const routeModels = buildDshRoute({ models, baseUrl: "unused-for-picker" }).models;
+  const settingsBefore = readDocument(DSH_SETTINGS_PATH);
+  const settingsAfter = applyPickerToSettings(settingsBefore, routeModels);
+  if (settingsAfter !== settingsBefore) writeDocument(DSH_SETTINGS_PATH, settingsAfter);
+  writeDocument(DSH_CATALOG_PATH, `${JSON.stringify({
+    ...published,
+    models: models.map((model) => String(model.slug)),
+    visionBridgeEngine: engine?.slug || null,
+  }, null, 2)}\n`);
+  return { refreshed: true, models: models.length, credentialsChanged: false };
+}
+
 export function uninstall() {
   const settingsBefore = readDocument(DSH_SETTINGS_PATH);
   const restored = restoreDefaultModel(removeRouteFromSettings(settingsBefore));
@@ -599,6 +632,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const command = process.argv[2] || "status";
   const handlers = {
     status: () => status(),
+    "refresh-picker": () => refreshPicker(),
     "caller-capability-refresh": () => refreshCallerCapability(),
     install: () => install({ setDefaultModel: process.argv.includes("--set-default-model") }),
     uninstall: () => uninstall(),
